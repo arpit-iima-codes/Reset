@@ -1,0 +1,1684 @@
+'use strict';
+/* Steady — personal fasting & craving companion
+ * All data lives on this phone (localStorage). Your server is optional:
+ * it sends push notifications and keeps a backup.
+ */
+
+/* ======================= constants ======================= */
+const KEY = 'steady.v1';
+const HOSTED = !!window.STEADY_HOSTED; // true in the claude.ai-hosted build (no own server)
+const H = 3600e3;
+const MIN = 60e3;
+
+const LEVELS = [
+  { n: 1, name: 'Foundation', fast: 12, steps: 4000 },
+  { n: 2, name: 'Momentum', fast: 14, steps: 5500 },
+  { n: 3, name: 'Strong', fast: 16, steps: 7000 },
+  { n: 4, name: 'Locked in', fast: 16, steps: 8500 },
+];
+const LEVEL_UP_DAYS = 10;
+
+const MOODS = ['Hungry', 'Stressed', 'Bored / lonely', 'Tired', 'Social / celebrating', 'Just habit'];
+const PLACES = ['Home', 'Work', 'Outside', 'Event / party', 'Travelling'];
+
+const STAGES = [
+  [0, 'Digesting your last meal'],
+  [4, 'Blood sugar settling down'],
+  [8, 'Using stored sugar (glycogen)'],
+  [12, 'Shifting toward burning fat'],
+  [16, 'Deep fast — every hour is a bonus'],
+  [20, 'Long fast — listen to your body'],
+];
+
+const SOS_TIPS = [
+  'Cravings rise, peak and fall like a wave. You don’t have to fight it — just watch it.',
+  'Notice where you feel it: mouth, stomach, chest? Name it. Naming a craving weakens it.',
+  'Drink a full glass of water slowly. Then decide.',
+  'Ask: am I hungry, or am I stressed, bored, or tired?',
+  'You are not saying no forever. You are saying “not right now”.',
+];
+
+const TITLES = { fast: 'Fast', sos: 'Craving SOS', log: 'Patterns', wins: 'Wins', numbers: 'Health' };
+
+/* ======================= state ======================= */
+function defaults() {
+  return {
+    v: 1,
+    settings: {
+      name: '',
+      sex: 'male',
+      heightCm: null,
+      startWeight: null,
+      defaultTarget: 14,
+      ldlTarget: 100,
+      futureMsg: '',
+      level: 1,
+      levelSince: dayKey(),
+      serverUrl: '',
+      token: '',
+      notify: false,
+      autoBackup: true,
+      tz: Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Kolkata',
+      lastBackup: null,
+    },
+    plans: [
+      { if: 'I want a snack after dinner', then: 'I brush my teeth and drink a glass of water' },
+      { if: 'I feel stressed and reach for food', then: 'I walk for 5 minutes first, then decide' },
+    ],
+    active: null, // { start, target }
+    fasts: [], // { start, end, target }
+    cravings: [], // { t, before, after, outcome: 'passed'|'still'|'ate' }
+    slips: [], // { t, moods: [], place, note }
+    days: {}, // 'YYYY-MM-DD': { sugarFree, steps, walk }
+    body: [], // { date, weight, waist }
+    labs: [], // { date, hba1c, fpg, ldl, hdl, tg, alt, sys, dia }
+    reminders: [], // { id, time: 'HH:MM', body, tab, enabled }
+    sos: null, // { phase, start, dur, before, kind }
+    watch: {}, // 'YYYY-MM-DD': { steps, activeEnergy, exerciseMinutes, restingHR, sleepHours, weight, at }
+  };
+}
+
+let S = load();
+let tab = 'fast';
+const ui = { target: S.settings.defaultTarget, slip: { moods: [], place: null, ago: 0 }, sosBefore: 6, sosAfter: 3 };
+
+function load() {
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (raw) return mergeState(JSON.parse(raw));
+  } catch (e) { /* storage blocked or corrupt */ }
+  return defaults();
+}
+function mergeState(d) {
+  const def = defaults();
+  const out = Object.assign(def, d || {});
+  out.settings = Object.assign(defaults().settings, (d && d.settings) || {});
+  for (const k of ['fasts', 'cravings', 'slips', 'body', 'labs', 'reminders', 'plans']) if (!Array.isArray(out[k])) out[k] = [];
+  if (!out.days || typeof out.days !== 'object') out.days = {};
+  if (!out.watch || typeof out.watch !== 'object') out.watch = {};
+  return out;
+}
+let backupTimer = null;
+function save() {
+  S.updatedAt = Date.now();
+  try { localStorage.setItem(KEY, JSON.stringify(S)); }
+  catch (e) { if (!HOSTED) toast('Could not save on this phone — export a backup from Settings.'); }
+  if (HOSTED) { scheduleCloudSave(); return; }
+  if (S.settings.autoBackup && S.settings.token) {
+    clearTimeout(backupTimer);
+    backupTimer = setTimeout(() => backupToServer(true), 8000);
+  }
+}
+
+/* ======================= cloud save (hosted build) ======================= */
+const cloud = { ref: null, status: HOSTED ? 'connecting' : 'off', downloads: null, saving: false, again: false };
+let cloudTimer = null;
+function scheduleCloudSave() {
+  if (!cloud.ref) return;
+  clearTimeout(cloudTimer);
+  cloudTimer = setTimeout(cloudSave, 1500);
+}
+async function cloudSave() {
+  if (!cloud.ref) return;
+  if (cloud.saving) { cloud.again = true; return; }
+  cloud.saving = true;
+  try {
+    await cloud.ref.set({ data: JSON.stringify(S), updatedAt: S.updatedAt || Date.now() });
+    cloud.status = 'saved';
+  } catch (e) {
+    cloud.status = 'error';
+    if (e && e.code === 'quota_exceeded') toast('Cloud storage is full — export a backup file from Settings.');
+  }
+  cloud.saving = false;
+  if (cloud.again) { cloud.again = false; cloudSave(); }
+}
+async function initCloud() {
+  if (!HOSTED || !window.claude || typeof window.claude.use !== 'function') { cloud.status = 'off'; return; }
+  try {
+    const [db, user, downloads] = await Promise.all([window.claude.use('db'), window.claude.use('user'), window.claude.use('downloads')]);
+    cloud.downloads = downloads || null;
+    if (!db || !user) { cloud.status = 'off'; return; }
+    const id = await user.id();
+    if (!id) { cloud.status = 'off'; return; }
+    cloud.ref = db.doc('data/users/' + id + '/state');
+    const snap = await cloud.ref.get();
+    if (snap.exists) {
+      let remote = null;
+      try { remote = JSON.parse(snap.data().data); } catch { remote = null; }
+      if (remote && (!S.updatedAt || (remote.updatedAt || 0) > S.updatedAt)) {
+        S = mergeState(remote);
+        try { localStorage.setItem(KEY, JSON.stringify(S)); } catch { /* ignore */ }
+        cloud.status = 'saved';
+        render();
+        return;
+      }
+    }
+    cloud.status = 'saved';
+    if (S.updatedAt) cloudSave();
+  } catch (e) {
+    cloud.status = 'off';
+  }
+}
+
+/* ======================= helpers ======================= */
+function $(s) { return document.querySelector(s); }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function pad(n) { return String(n).padStart(2, '0'); }
+function dayKey(d = new Date()) { d = new Date(d); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
+function addDays(key, n) { const [y, m, dd] = key.split('-').map(Number); return dayKey(new Date(y, m - 1, dd + n)); }
+function hhmm(d) { d = new Date(d); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; }
+function fmtHMS(ms) { ms = Math.max(0, ms); const s = Math.floor(ms / 1000); return `${pad(Math.floor(s / 3600))}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`; }
+function fmtMS(ms) { ms = Math.max(0, ms); const s = Math.ceil(ms / 1000); return `${Math.floor(s / 60)}:${pad(s % 60)}`; }
+function fmtTime(t) { return new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
+function toDate(t) {
+  if (typeof t === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(t)) { const [y, m, d] = t.split('-').map(Number); return new Date(y, m - 1, d); }
+  return new Date(t);
+}
+function fmtDay(t) { return toDate(t).toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' }); }
+function fmtHour(h) { const d = new Date(); d.setHours(h, 0, 0, 0); return d.toLocaleTimeString([], { hour: 'numeric' }); }
+function num(v) { if (v === '' || v == null) return null; const n = Number(v); return Number.isFinite(n) ? n : null; }
+function round1(n) { return Math.round(n * 10) / 10; }
+function uid() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4); }
+function level() { const i = Math.min(LEVELS.length, Math.max(1, S.settings.level || 1)) - 1; return LEVELS[i]; }
+function dayData(k) { return S.days[k] || { sugarFree: false, steps: 0, walk: false }; }
+function setDay(k, patch) { S.days[k] = Object.assign({}, dayData(k), patch); save(); }
+
+/* ======================= fasting logic ======================= */
+function bestFastOn(k) {
+  let m = 0;
+  for (const f of S.fasts) if (dayKey(f.end) === k) m = Math.max(m, f.end - f.start);
+  if (k === dayKey() && S.active) m = Math.max(m, Date.now() - S.active.start);
+  return m;
+}
+function fastMetOn(k) {
+  if (S.fasts.some((f) => dayKey(f.end) === k && f.end - f.start >= f.target * H)) return true;
+  return k === dayKey() && !!S.active && Date.now() - S.active.start >= S.active.target * H;
+}
+function levelFastMet(k) { return bestFastOn(k) >= level().fast * H; }
+function fullDay(k) { const d = dayData(k); return levelFastMet(k) && d.sugarFree && (d.steps || 0) >= level().steps; }
+function firstDataDay() {
+  const ts = [...S.fasts.map((f) => f.start), S.active && S.active.start].filter(Boolean);
+  let first = ts.length ? dayKey(Math.min(...ts)) : dayKey();
+  for (const k of Object.keys(S.days)) if (k < first) first = k;
+  return first;
+}
+/* "Never miss twice": streak survives single missed days, breaks on two in a row. */
+function streak() {
+  const today = dayKey();
+  const first = firstDataDay();
+  let k = fastMetOn(today) ? today : addDays(today, -1);
+  let n = 0, prevMiss = false;
+  while (k >= first) {
+    if (fastMetOn(k)) { n++; prevMiss = false; }
+    else { if (prevMiss) break; prevMiss = true; }
+    k = addDays(k, -1);
+  }
+  return n;
+}
+function levelProgress() {
+  let k = S.settings.levelSince || dayKey();
+  const today = dayKey();
+  let n = 0;
+  while (k <= today) { if (fullDay(k)) n++; k = addDays(k, 1); }
+  return n;
+}
+function stageText(ms) {
+  const h = ms / H;
+  let t = STAGES[0][1];
+  for (const [at, txt] of STAGES) if (h >= at) t = txt;
+  return t;
+}
+
+/* ======================= server ======================= */
+function apiBase() { return (S.settings.serverUrl || '').replace(/\/+$/, ''); }
+async function api(method, path, body) {
+  const res = await fetch(apiBase() + path, {
+    method,
+    headers: Object.assign({ 'Content-Type': 'application/json' }, S.settings.token ? { 'X-App-Token': S.settings.token } : {}),
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let data = {};
+  try { data = await res.json(); } catch { /* empty */ }
+  if (!res.ok) throw new Error(data.error || `Server said ${res.status}`);
+  return data;
+}
+function serverConfigured() { return !!S.settings.notify; }
+
+/* Apple Watch data arrives on the server from an iPhone Shortcuts automation */
+async function syncWatch() {
+  if (HOSTED) return;
+  let r = null;
+  try { r = await api('GET', '/api/watch?since=' + addDays(dayKey(), -21)); } catch (e) { return; }
+  if (!r || !r.days) return;
+  let changed = false;
+  for (const [k, v] of Object.entries(r.days)) {
+    const prev = S.watch[k];
+    if (prev && prev.at === v.at) continue;
+    S.watch[k] = v;
+    changed = true;
+    if (v.steps != null && v.steps > (dayData(k).steps || 0)) S.days[k] = Object.assign({}, dayData(k), { steps: Math.round(v.steps) });
+    if (v.weight != null && !S.body.some((b) => b.date === k && b.weight != null)) {
+      S.body = S.body.filter((b) => b.date !== k);
+      S.body.push({ date: k, weight: v.weight, waist: null });
+      S.body.sort((a, b) => (a.date < b.date ? -1 : 1));
+    }
+  }
+  if (changed) { save(); render(); }
+}
+function lastWatch() {
+  const ks = Object.keys(S.watch || {}).sort();
+  return ks.length ? { date: ks[ks.length - 1], ...S.watch[ks[ks.length - 1]] } : null;
+}
+async function quiet(fn) { try { return await fn(); } catch (e) { return null; } }
+
+async function syncFastToServer() {
+  if (!serverConfigured()) return;
+  if (S.active) await quiet(() => api('POST', '/api/fast', { start: S.active.start, targetHours: S.active.target }));
+  else await quiet(() => api('DELETE', '/api/fast'));
+}
+async function syncReminders(showToast) {
+  if (!serverConfigured()) { if (showToast) toast('Turn on notifications first (Settings).'); return; }
+  try {
+    await api('PUT', '/api/reminders', {
+      tz: S.settings.tz,
+      reminders: S.reminders.map((r) => ({ id: r.id, time: r.time, title: 'Steady', body: r.body, tab: r.tab || 'sos', enabled: r.enabled !== false })),
+    });
+    if (showToast) toast('Reminders saved on your server');
+  } catch (e) { if (showToast) toast('Could not reach server: ' + e.message); }
+}
+async function backupToServer(silent) {
+  if (!S.settings.token && !silent) { /* allow tokenless servers on manual backup */ }
+  try {
+    const r = await api('PUT', '/api/backup', { data: S });
+    S.settings.lastBackup = r.at;
+    try { localStorage.setItem(KEY, JSON.stringify(S)); } catch { /* ignore */ }
+    if (!silent) toast('Backed up to your server');
+  } catch (e) { if (!silent) toast('Backup failed: ' + e.message); }
+}
+function urlB64ToUint8Array(b64) {
+  const padding = '='.repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + padding).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
+}
+async function enablePush() {
+  const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+  if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
+    toast(standalone ? 'This iPhone doesn’t support web push (needs iOS 16.4+).' : 'On iPhone: Share → Add to Home Screen, then open Steady from the icon and try again.');
+    return;
+  }
+  try {
+    await api('GET', '/api/auth-check');
+  } catch (e) { toast('Server check failed: ' + e.message); return; }
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') { toast('Notifications were not allowed. Enable them in iPhone Settings → Notifications → Steady.'); return; }
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const { publicKey } = await api('GET', '/api/vapid');
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8Array(publicKey) });
+    await api('POST', '/api/subscribe', { subscription: sub.toJSON() });
+    S.settings.notify = true; save();
+    await syncReminders(false);
+    await syncFastToServer();
+    toast('Notifications are on ✅');
+    openSettings();
+  } catch (e) { toast('Could not turn on notifications: ' + e.message); }
+}
+
+/* ======================= UI primitives ======================= */
+let toastTimer = null;
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('on'), 3200);
+}
+function openSheet(html) {
+  $('#sheet').innerHTML = '<div class="grab"></div>' + html;
+  $('#sheet').scrollTop = 0;
+  $('#sheet').classList.add('on');
+  $('#backdrop').classList.add('on');
+}
+function closeSheet() { $('#sheet').classList.remove('on'); $('#backdrop').classList.remove('on'); }
+
+function go(t) {
+  tab = TITLES[t] ? t : 'fast';
+  document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === tab));
+  render();
+  window.scrollTo(0, 0);
+}
+
+function render() {
+  $('#title').textContent = TITLES[tab];
+  const hr = new Date().getHours();
+  const part = hr < 5 ? 'Late night' : hr < 12 ? 'Good morning' : hr < 17 ? 'Good afternoon' : hr < 21 ? 'Good evening' : 'Late evening';
+  $('#greet').textContent = S.settings.name ? `${part}, ${S.settings.name}` : part;
+  const view = $('#view');
+  view.innerHTML = { fast: renderFast, sos: renderSos, log: renderLog, wins: renderWins, numbers: renderNumbers }[tab]();
+}
+
+/* ======================= FAST ======================= */
+function ring(pct, inner, done) {
+  const r = 100, c = 2 * Math.PI * r;
+  return `<div class="ring"><svg viewBox="0 0 240 240" aria-hidden="true">
+    <defs><linearGradient id="gdone" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3ddc97"/><stop offset="1" stop-color="#7fb2ff"/></linearGradient></defs>
+    <circle cx="120" cy="120" r="${r}" class="ring-bg"/>
+    <circle id="ringFg" cx="120" cy="120" r="${r}" class="ring-fg ${done ? 'done' : ''}" stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${(c * (1 - pct)).toFixed(1)}" transform="rotate(-90 120 120)"/>
+  </svg><div class="ring-center">${inner}</div></div>`;
+}
+
+function renderFast() {
+  const a = S.active;
+  const lv = level();
+  let html = '';
+  if (a) {
+    const el = Date.now() - a.start;
+    const pct = Math.min(1, el / (a.target * H));
+    const done = el >= a.target * H;
+    html += `<section class="card center">
+      ${ring(pct, `<div class="eyebrow" id="fastLabel">${done ? 'Goal reached' : 'Fasting'}</div>
+        <div class="big mono" id="fastElapsed">${fmtHMS(el)}</div>
+        <div class="muted small">goal ${a.target}h · at ${fmtTime(a.start + a.target * H)}</div>`, done)}
+      <div class="stage" id="fastStage">${esc(stageText(el))}</div>
+      <div class="row gap">
+        <button class="btn ghost grow" data-act="editStart">Edit start</button>
+        <button class="btn grow ${done ? '' : 'amber'}" data-act="endFast">${done ? 'Finish fast' : 'End fast'}</button>
+      </div>
+      <p class="muted small" style="margin-top:12px">Stages are approximate and vary person to person.</p>
+    </section>`;
+    html += liveCard();
+  } else {
+    html += `<section class="card center">
+      <div class="eyebrow">Ready when you are</div>
+      <h2>Start a fast</h2>
+      <div class="chips center">${[12, 13, 14, 16, 18].map((h) => `<button class="chip ${h === ui.target ? 'on' : ''}" data-act="setTarget" data-h="${h}">${h}h</button>`).join('')}</div>
+      <label class="field inline">Last bite at <input type="time" id="startTime" value="${hhmm(new Date())}"></label>
+      <button class="btn block" data-act="startFast">Start ${ui.target}h fast</button>
+      <p class="muted small">Your level goal is ${lv.fast}h. Water, black coffee and plain tea are fine.</p>
+    </section>`;
+  }
+  const recent = S.fasts.slice(-7);
+  const st = streak();
+  html += `<section class="card">
+    <div class="card-head"><h3>Recent fasts</h3><span class="pill ${st ? 'ok' : ''}">\u{1F525} ${st} day${st === 1 ? '' : 's'}</span></div>
+    ${recent.length ? bars(recent) : '<p class="muted">Finished fasts show up here.</p>'}
+    <p class="muted small">Streak rule: never miss twice. One missed day won’t break it.</p>
+  </section>`;
+  if (!S.settings.futureMsg) {
+    html += `<section class="card flat"><h3>Write to your future self</h3>
+      <p class="muted">A few lines from you, on a good day, shown when you’re about to give in. It’s the most powerful thing in this app.</p>
+      <button class="btn ghost block" data-act="openSettings" data-focus="futureMsg">Write it now</button></section>`;
+  }
+  return html;
+}
+
+function bars(list) {
+  const max = Math.max(18, ...list.map((f) => (f.end - f.start) / H));
+  return `<div class="bars">${list.map((f) => {
+    const h = (f.end - f.start) / H;
+    return `<div class="bar-col"><div class="bar-val">${h.toFixed(1)}</div>
+      <div class="bar ${h >= f.target ? '' : 'short'}" style="height:${Math.max(4, (h / max) * 100)}%"></div>
+      <div class="bar-lbl">${new Date(f.end).toLocaleDateString([], { weekday: 'short' }).slice(0, 2)}</div></div>`;
+  }).join('')}</div>`;
+}
+
+function startFast() {
+  const v = ($('#startTime') || {}).value;
+  let start = Date.now();
+  if (v) {
+    const [h, m] = v.split(':').map(Number);
+    const d = new Date(); d.setHours(h, m, 0, 0);
+    if (d.getTime() > Date.now() + MIN) d.setDate(d.getDate() - 1);
+    start = d.getTime();
+  }
+  S.active = { start, target: ui.target };
+  S.settings.defaultTarget = ui.target;
+  save();
+  syncFastToServer();
+  toast(`Fast started — goal ${ui.target}h`);
+  render();
+}
+
+function endFast() {
+  const a = S.active;
+  if (!a) return;
+  const el = Date.now() - a.start;
+  if (el >= a.target * H) return finishFast();
+  const left = a.target * H - el;
+  openSheet(`<h2>Ending early?</h2>
+    <p class="muted">You’re ${fmtHMS(el).slice(0, 5)} in — ${Math.floor(Math.ceil(left / MIN) / 60)}h ${Math.ceil(left / MIN) % 60}m to your goal.</p>
+    ${eatNowCompare(el / H)}
+    ${S.settings.futureMsg ? `<div class="future" style="margin-top:12px">${esc(S.settings.futureMsg)}</div>` : ''}
+    <div class="stack" style="margin-top:16px">
+      <button class="btn block" data-act="sosFromFast">Ride it out for 10 minutes</button>
+      <button class="btn ghost block" data-act="closeSheet">Keep going</button>
+      <button class="link block" data-act="finishFast">End fast now (that’s okay too)</button>
+    </div>`);
+}
+
+function finishFast() {
+  const a = S.active;
+  if (!a) return;
+  const end = Date.now();
+  const met = end - a.start >= a.target * H;
+  S.fasts.push({ start: a.start, end, target: a.target });
+  S.active = null;
+  save();
+  syncFastToServer();
+  closeSheet();
+  if (met) {
+    openSheet(`<div class="center"><div class="confetti">\u{1F389}</div><h2>${round1((end - a.start) / H)}h fast complete</h2>
+      <p class="muted">One more vote for the person you’re becoming.</p>
+      <p>Break it gently: protein + vegetables first, slow down, stop at 80% full.</p>
+      <button class="btn block" data-act="closeSheet">Nice</button></div>`);
+  } else {
+    toast('Fast logged. Tomorrow is a fresh one — never miss twice.');
+  }
+  render();
+}
+
+function editStart() {
+  const a = S.active;
+  const d = new Date(a.start);
+  const local = `${dayKey(d)}T${hhmm(d)}`;
+  openSheet(`<h2>Edit fast</h2>
+    <label class="field"><span>Started at</span><input type="datetime-local" id="editStartAt" value="${local}"></label>
+    <label class="field"><span>Goal (hours)</span>
+      <select id="editTarget">${[12, 13, 14, 15, 16, 18, 20, 24].map((h) => `<option ${h === a.target ? 'selected' : ''}>${h}</option>`).join('')}</select></label>
+    <div class="stack"><button class="btn block" data-act="saveStart">Save</button>
+    <button class="link block" data-act="cancelFast" style="color:var(--red)">Delete this fast</button></div>`);
+}
+
+/* ======================= SOS ======================= */
+function sosStats() {
+  const c = S.cravings;
+  const passed = c.filter((x) => x.outcome === 'passed').length;
+  const drops = c.filter((x) => x.after != null).map((x) => x.before - x.after);
+  const avgDrop = drops.length ? drops.reduce((a, b) => a + b, 0) / drops.length : 0;
+  return { total: c.length, passed, pct: c.length ? Math.round((passed / c.length) * 100) : 0, avgDrop };
+}
+
+function renderSos() {
+  const s = S.sos;
+  if (s && s.phase === 'during') return renderSosDuring();
+  if (s && s.phase === 'after') return renderSosAfter();
+  const st = sosStats();
+  return `<section class="card center">
+      <div class="eyebrow">A craving is just a wave</div>
+      <button class="sos-btn" data-act="sosStart" data-kind="surf">I’m craving<small>10-minute ride</small></button>
+      <div style="max-width:320px;margin:8px auto 0">
+        <div class="row" style="justify-content:space-between"><span class="muted small">How strong right now?</span><b id="beforeVal">${ui.sosBefore}/10</b></div>
+        <input type="range" min="1" max="10" value="${ui.sosBefore}" data-input="sosBefore" aria-label="Craving strength">
+        <div class="range-labels"><span>mild</span><span>overwhelming</span></div>
+      </div>
+      <button class="btn ghost block" style="margin-top:12px" data-act="sosStart" data-kind="later">Not no — just later (15 min)</button>
+    </section>
+    <section class="card">
+      <h3>Your track record</h3>
+      ${st.total ? `<div class="stats" style="margin-top:10px">
+          <div class="stat"><div class="v">${st.total}</div><div class="l">cravings faced</div></div>
+          <div class="stat"><div class="v">${st.pct}%</div><div class="l">passed</div></div>
+          <div class="stat"><div class="v">−${round1(st.avgDrop)}</div><div class="l">avg strength drop</div></div>
+        </div>
+        ${st.total >= 5 ? `<p class="small" style="margin-top:12px">Proof from your own data: <b>${st.pct}%</b> of your cravings faded without eating.</p>` : ''}`
+        : '<p class="muted">Every craving you ride out gets counted here. Over a few weeks this becomes your proof that cravings pass.</p>'}
+    </section>
+    ${plansCard()}`;
+}
+
+function plansCard() {
+  return `<section class="card">
+    <div class="card-head"><h3>My if-then plans</h3><button class="link" data-act="openSettings" data-focus="plans">Edit</button></div>
+    ${S.plans.length ? S.plans.map((p) => `<div class="plan"><div>If <b>${esc(p.if)}</b>, then ${esc(p.then)}.</div></div>`).join('') : '<p class="muted">Add a plan for your hardest moment.</p>'}
+  </section>`;
+}
+
+function renderSosDuring() {
+  const s = S.sos;
+  const left = s.dur - (Date.now() - s.start);
+  const tip = SOS_TIPS[Math.floor(s.start / 1000) % SOS_TIPS.length];
+  return `<section class="card center">
+      <div class="eyebrow">${s.kind === 'later' ? 'Not no — just later' : 'Riding the wave'}</div>
+      <div class="breath-wrap"><div class="breath"></div>
+        <div class="breath-label"><div class="big mono" id="sosLeft">${fmtMS(left)}</div><div class="muted" id="breathCue">Breathe in</div></div>
+      </div>
+      <p class="muted">${esc(tip)}</p>
+    </section>
+    ${S.settings.futureMsg ? `<section class="card"><h3>From you, on a good day</h3><div class="future" style="margin-top:10px">${esc(S.settings.futureMsg)}</div></section>` : ''}
+    ${plansCard()}
+    <div class="stack">
+      <button class="btn ghost block" data-act="sosFinish">It’s already passed</button>
+    </div>`;
+}
+
+function renderSosAfter() {
+  return `<section class="card center">
+    <div class="eyebrow">Time’s up</div>
+    <h2>How strong is it now?</h2>
+    <p class="muted">It started at ${S.sos.before}/10.</p>
+    <div style="max-width:320px;margin:0 auto">
+      <div class="row" style="justify-content:space-between"><span class="muted small">Now</span><b id="afterVal">${ui.sosAfter}/10</b></div>
+      <input type="range" min="0" max="10" value="${ui.sosAfter}" data-input="sosAfter" aria-label="Craving strength now">
+    </div>
+    <div class="stack" style="margin-top:16px">
+      <button class="btn block" data-act="sosOutcome" data-o="passed">It passed \u{1F389}</button>
+      <button class="btn ghost block" data-act="sosOutcome" data-o="still">Still there — 5 more minutes</button>
+      <button class="link block" data-act="sosOutcome" data-o="ate">I ate (log it, no judgment)</button>
+    </div>
+  </section>`;
+}
+
+function sosStart(kind) {
+  S.sos = { phase: 'during', start: Date.now(), dur: (kind === 'later' ? 15 : 10) * MIN, before: ui.sosBefore, kind };
+  save();
+  go('sos');
+}
+
+function sosOutcome(o) {
+  const s = S.sos;
+  if (!s) return;
+  if (o === 'still') {
+    S.sos = { phase: 'during', start: Date.now(), dur: 5 * MIN, before: s.before, kind: 'surf' };
+    save(); render(); return;
+  }
+  S.cravings.push({ t: s.start, before: s.before, after: ui.sosAfter, outcome: o });
+  S.sos = null;
+  save();
+  if (o === 'passed') {
+    const st = sosStats();
+    openSheet(`<div class="center"><div class="confetti">\u{1F30A}</div><h2>You rode the wave</h2>
+      <p class="muted">That’s ${st.passed} craving${st.passed === 1 ? '' : 's'} passed so far. Your brain is learning that it doesn’t need to obey every urge.</p>
+      <button class="btn block" data-act="closeSheet">Thanks</button></div>`);
+    render();
+  } else {
+    ui.slip = { moods: [], place: null, ago: 0 };
+    toast('Logged. Add what happened — it helps find your patterns.');
+    go('log');
+  }
+}
+
+/* ======================= PATTERNS (slip log) ======================= */
+function hourCounts() {
+  const slips = new Array(24).fill(0), crav = new Array(24).fill(0);
+  for (const s of S.slips) slips[new Date(s.t).getHours()]++;
+  for (const c of S.cravings) if (c.outcome !== 'ate') crav[new Date(c.t).getHours()]++;
+  return { slips, crav };
+}
+function dangerWindow() {
+  const { slips, crav } = hourCounts();
+  let best = -1, bh = 0;
+  for (let h = 0; h < 24; h++) {
+    const v = 2 * (slips[h] + slips[(h + 1) % 24]) + crav[h] + crav[(h + 1) % 24];
+    if (v > best) { best = v; bh = h; }
+  }
+  return { start: bh, end: (bh + 2) % 24, score: best, slips, crav };
+}
+function topOf(arr) {
+  const m = new Map();
+  for (const x of arr) m.set(x, (m.get(x) || 0) + 1);
+  return [...m.entries()].sort((a, b) => b[1] - a[1]);
+}
+
+function renderLog() {
+  const sl = ui.slip;
+  let html = `<section class="card">
+    <h3>Slipped? Log it in 3 taps</h3>
+    <p class="muted small">No judgment. This is data — it shows when and why you’re vulnerable.</p>
+    <div class="eyebrow" style="margin-top:12px">How were you feeling?</div>
+    <div class="chips">${MOODS.map((m) => `<button class="chip ${sl.moods.includes(m) ? 'on' : ''}" data-act="slipMood" data-v="${esc(m)}">${esc(m)}</button>`).join('')}</div>
+    <div class="eyebrow">Where?</div>
+    <div class="chips">${PLACES.map((p) => `<button class="chip ${sl.place === p ? 'on' : ''}" data-act="slipPlace" data-v="${esc(p)}">${esc(p)}</button>`).join('')}</div>
+    <div class="eyebrow">When?</div>
+    <div class="chips">${[[0, 'Just now'], [30, '30 min ago'], [60, '1 h ago'], [120, '2 h ago']].map(([v, l]) => `<button class="chip ${sl.ago === v ? 'on' : ''}" data-act="slipAgo" data-v="${v}">${l}</button>`).join('')}</div>
+    <input type="text" id="slipNote" placeholder="What did you eat? (optional)" maxlength="120">
+    <button class="btn block" style="margin-top:12px" data-act="logSlip">Log it</button>
+  </section>`;
+
+  const total = S.slips.length + S.cravings.length;
+  html += `<section class="card"><h3>Your danger hours</h3>`;
+  if (total < 3) {
+    html += `<p class="muted">Log a few slips or cravings (${total}/3) and your risky times will appear here.</p>`;
+  } else {
+    const w = dangerWindow();
+    const max = Math.max(1, ...w.slips.map((s, i) => s + w.crav[i]));
+    const inWin = (h) => h === w.start || h === (w.start + 1) % 24;
+    html += `<div class="hist" role="img" aria-label="Slips and cravings by hour of day">${w.slips.map((s, h) => `<div class="h ${inWin(h) ? 'win' : ''}">
+        <div class="s" style="height:${(s / max) * 100}%"></div><div class="c" style="height:${(w.crav[h] / max) * 100}%"></div></div>`).join('')}</div>
+      <div class="hist-axis"><span>12am</span><span>6am</span><span>12pm</span><span>6pm</span><span>11pm</span></div>
+      <div class="legend"><span><i style="background:var(--red)"></i>slips</span><span><i style="background:rgba(255,181,71,.65)"></i>cravings resisted</span></div>
+      <div class="card flat" style="margin:14px 0 0">
+        <div class="eyebrow">Most vulnerable</div>
+        <div style="font-size:22px;font-weight:750;margin:2px 0">${fmtHour(w.start)} – ${fmtHour(w.end)}</div>
+        ${patternLine()}
+        <button class="btn block" style="margin-top:10px" data-act="addDangerReminder" data-h="${w.start}">Alert me daily at ${fmtTime(new Date().setHours(w.start, 0, 0, 0) - 15 * MIN)}</button>
+      </div>`;
+  }
+  html += `</section>`;
+
+  if (S.slips.length) {
+    html += `<section class="card"><h3>Recent slips</h3>${S.slips.slice(-10).reverse().map((s) => `<div class="list-item">
+      <div class="grow"><b>${fmtDay(s.t)}, ${fmtTime(s.t)}</b>${s.place ? ` · ${esc(s.place)}` : ''}<div class="muted">${esc((s.moods || []).join(', ') || '—')}${s.note ? ` · ${esc(s.note)}` : ''}</div></div>
+      <button class="x" data-act="delSlip" data-t="${s.t}" aria-label="Delete">×</button></div>`).join('')}</section>`;
+  }
+  return html;
+}
+
+function patternLine() {
+  if (S.slips.length < 2) return '<p class="muted small">Log more slips to see your top trigger.</p>';
+  const moods = topOf(S.slips.flatMap((s) => s.moods || []));
+  const places = topOf(S.slips.map((s) => s.place).filter(Boolean));
+  const parts = [];
+  if (moods.length) parts.push(`most often when <b>${esc(moods[0][0].toLowerCase())}</b>`);
+  if (places.length) parts.push(`usually at <b>${esc(places[0][0].toLowerCase())}</b>`);
+  return parts.length ? `<p class="small">You slip ${parts.join(', ')}.</p>` : '';
+}
+
+function logSlip() {
+  const note = ($('#slipNote') || {}).value || '';
+  const t = Date.now() - ui.slip.ago * MIN;
+  S.slips.push({ t, moods: ui.slip.moods.slice(), place: ui.slip.place, note: note.trim() });
+  ui.slip = { moods: [], place: null, ago: 0 };
+  save();
+  toast('Logged. One slip is just one slip — never miss twice.');
+  render();
+}
+
+/* ======================= WINS ======================= */
+function renderWins() {
+  const lv = level();
+  const today = dayKey();
+  const d = dayData(today);
+  const best = bestFastOn(today);
+  const fastOk = best >= lv.fast * H;
+  const stepsOk = (d.steps || 0) >= lv.steps;
+  const prog = levelProgress();
+  const next = LEVELS[lv.n] || null;
+  const st = streak();
+
+  let html = `<section class="card">
+    <div class="card-head"><div><div class="eyebrow">Level ${lv.n}</div><h2 style="margin:2px 0 0">${lv.name}</h2></div><span class="pill ok">${lv.fast}h · ${lv.steps.toLocaleString()} steps</span></div>
+    ${next ? `<div class="progress"><div style="width:${Math.min(100, (prog / LEVEL_UP_DAYS) * 100)}%"></div></div>
+      <div class="muted small">${Math.min(prog, LEVEL_UP_DAYS)}/${LEVEL_UP_DAYS} full days to <b>${next.name}</b> (${next.fast}h · ${next.steps.toLocaleString()} steps)</div>
+      ${prog >= LEVEL_UP_DAYS ? `<button class="btn block" style="margin-top:12px" data-act="levelUp">Level up to ${next.name}</button>` : ''}`
+      : '<p class="muted">Top level. This is who you are now.</p>'}
+    ${lv.n > 1 ? `<button class="link" data-act="levelDown">Too hard right now? Step back a level</button>` : ''}
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h3>Today</h3>${fullDay(today) ? '<span class="pill ok">Full day ✅</span>' : ''}</div>
+    <div class="check">
+      <div class="tick ${fastOk ? 'on' : ''}">✓</div>
+      <div class="grow"><div>Fast ${lv.fast}h+</div><div class="sub">${S.active ? `In progress · ${round1((Date.now() - S.active.start) / H)}h` : best ? `Best today: ${round1(best / H)}h` : 'Counts when a fast ends today'}</div></div>
+    </div>
+    <div class="check">
+      <button class="tick ${d.sugarFree ? 'on' : ''}" data-act="toggleDay" data-k="sugarFree" aria-label="No sugary drinks">✓</button>
+      <div class="grow"><div>No sugary drinks</div><div class="sub">Cold drinks, packaged juice, sweet chai/coffee</div></div>
+    </div>
+    <div class="check">
+      <div class="tick ${stepsOk ? 'on' : ''}">✓</div>
+      <div class="grow"><div>${lv.steps.toLocaleString()} steps</div><div class="sub">${S.watch[today] && S.watch[today].steps != null ? `⌚ From Apple Watch · ${fmtTime(S.watch[today].at)}` : HOSTED ? 'Copy from the Health app' : 'Copy from Health, or set up Apple Watch sync'}</div></div>
+      <input class="steps-input" type="number" inputmode="numeric" min="0" placeholder="0" value="${d.steps || ''}" data-input="steps" aria-label="Steps today">
+    </div>
+    <div class="check">
+      <button class="tick ${d.walk ? 'on' : ''}" data-act="toggleDay" data-k="walk" aria-label="Walk after a meal">✓</button>
+      <div class="grow"><div>10-min walk after a meal <span class="muted small">(bonus)</span></div><div class="sub">Helps blunt the blood-sugar spike</div></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h3>Streak</h3><span class="pill ${st ? 'ok' : ''}">\u{1F525} ${st}</span></div>
+    <div class="dots">${last14().map((x) => `<div class="dot ${x.cls}" title="${x.k}"></div>`).join('')}</div>
+    <div class="row" style="justify-content:space-between;margin-top:6px"><span class="muted small">2 weeks ago</span><span class="muted small">today</span></div>
+    <p class="muted small">Green = fast goal met. Missing one day is human. Just never miss twice.</p>
+  </section>
+
+  <section class="card center">
+    <div class="eyebrow">Votes for the person you’re becoming</div>
+    <div class="big mono" style="margin:6px 0">${votes()}</div>
+    <p class="muted small">Every fast finished, sugar-free day, step goal, walk and craving ridden out counts as one vote.</p>
+  </section>`;
+  return html;
+}
+
+function last14() {
+  const today = dayKey();
+  const first = firstDataDay();
+  const out = [];
+  for (let i = 13; i >= 0; i--) {
+    const k = addDays(today, -i);
+    let cls = '';
+    if (fastMetOn(k)) cls = 'win';
+    else if (k < today && k >= first) cls = 'miss';
+    if (k === today) cls += ' today';
+    out.push({ k, cls });
+  }
+  return out;
+}
+
+function votes() {
+  let v = S.fasts.filter((f) => f.end - f.start >= f.target * H).length;
+  for (const d of Object.values(S.days)) {
+    if (d.sugarFree) v++;
+    if (d.walk) v++;
+    if ((d.steps || 0) >= 4000) v++;
+  }
+  v += S.cravings.filter((c) => c.outcome === 'passed').length;
+  return v;
+}
+
+/* ======================= VISUALS (animated, driven by today's discipline) ======================= */
+function rng(seed) { let s = (seed >>> 0) || 1; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function mixHex(a, b, t) {
+  const pa = [1, 3, 5].map((i) => parseInt(a.slice(i, i + 2), 16));
+  const pb = [1, 3, 5].map((i) => parseInt(b.slice(i, i + 2), 16));
+  return '#' + pa.map((v, i) => Math.round(v + (pb[i] - v) * clamp(t, 0, 1)).toString(16).padStart(2, '0')).join('');
+}
+const f1 = (n) => Number(n).toFixed(1);
+
+/* ---------- discipline: your habits, day by day ---------- */
+function dayScore(k) {
+  const d = dayData(k);
+  let s = 0;
+  if (fastMetOn(k)) s += 0.5;
+  if (d.sugarFree) s += 0.2;
+  if ((d.steps || 0) >= level().steps) s += 0.2;
+  if (d.walk) s += 0.1;
+  s -= 0.2 * S.slips.filter((x) => dayKey(x.t) === k).length;
+  return clamp(s, 0, 1);
+}
+/* average of a 14-day window; offset 0 = the last 14 days (today counts only once it has something in it) */
+function discipline(offset) {
+  const today = dayKey();
+  const first = firstDataDay();
+  let sum = 0, c = 0;
+  for (let i = offset; i < offset + 14; i++) {
+    const k = addDays(today, -i);
+    if (k < first) break;
+    if (k === today) { const t = dayScore(k); if (t <= 0) continue; sum += t; c++; continue; }
+    sum += dayScore(k); c++;
+  }
+  return c ? sum / c : null;
+}
+const BASELINE_DISC = 0.35; // assumed "before Steady" habits
+function habitStates() {
+  const now = discipline(0);
+  const prev = discipline(14);
+  return { now: now == null ? BASELINE_DISC : now, prev: prev == null ? BASELINE_DISC : prev, hasData: now != null };
+}
+
+/* ---------- artery ---------- */
+function arteryScore(l) {
+  if (!l) return null;
+  const parts = [];
+  if (l.ldl != null) parts.push([clamp((l.ldl - 70) / 110, 0, 1), 3]);
+  if (l.tg != null) parts.push([clamp((l.tg - 100) / 200, 0, 1), 1.5]);
+  if (l.hdl != null) parts.push([clamp((60 - l.hdl) / 30, 0, 1), 1.5]);
+  if (l.sys != null) parts.push([clamp((l.sys - 115) / 45, 0, 1), 2]);
+  if (l.hba1c != null) parts.push([clamp((l.hba1c - 5.3) / 2, 0, 1), 1.5]);
+  if (!parts.length) return null;
+  const w = parts.reduce((a, p) => a + p[1], 0);
+  return parts.reduce((a, p) => a + p[0] * p[1], 0) / w;
+}
+function latestLab() { const l = S.labs.slice().sort((a, b) => (a.date < b.date ? -1 : 1)); return l[l.length - 1] || null; }
+function plaqueFromHabits(disc) {
+  const base = arteryScore(latestLab());
+  return clamp((base == null ? 0.55 : base) * (1.3 - 0.75 * disc), 0.05, 1);
+}
+function plaquePaths(score) {
+  const top = 40, bot = 130, half = 45;
+  const narrow = 0.1 + 0.6 * score;
+  const h1 = half * narrow * 1.15, h2 = half * narrow * 0.85;
+  return {
+    t: `M88,${top} C118,${top} 128,${f1(top + h1)} 160,${f1(top + h1)} C192,${f1(top + h1)} 204,${top} 236,${top} Z`,
+    b: `M150,${bot} C180,${bot} 192,${f1(bot - h2)} 216,${f1(bot - h2)} C242,${f1(bot - h2)} 254,${bot} 286,${bot} Z`,
+    narrow, h1, h2,
+  };
+}
+/* opts: { from: score to animate from, fat: n droplets, sugar: n glucose dots, flood: bool } */
+function arterySvg(score, id, opts = {}) {
+  const W = 340, top = 40, bot = 130, mid = 85;
+  const P = plaquePaths(score);
+  const P0 = opts.from != null ? plaquePaths(opts.from) : null;
+  const nar = Math.max(P.narrow, P0 ? P0.narrow : 0);
+  const r = rng(7);
+  const anim = (from, to) => P0 ? `<animate attributeName="d" values="${from};${from};${to}" keyTimes="0;.25;1" dur="4.5s" fill="freeze" calcMode="spline" keySplines="0 0 1 1;.45 0 .2 1"/>` : '';
+  let speck = '';
+  const big = P0 && P0.narrow > P.narrow ? P0 : P;
+  for (let i = 0; i < 26; i++) {
+    const onTop = i % 2 === 0;
+    const x = onTop ? 112 + r() * 96 : 172 + r() * 92;
+    const y = onTop ? top + 2 + r() * Math.max(2, big.h1 - 4) : bot - 2 - r() * Math.max(2, big.h2 - 4);
+    speck += r() < 0.4
+      ? `<rect x="${f1(x)}" y="${f1(y)}" width="${f1(3 + r() * 5)}" height="1.1" fill="rgba(255,255,240,.75)" transform="rotate(${Math.round(r() * 180)} ${f1(x)} ${f1(y)})"/>`
+      : `<circle cx="${f1(x)}" cy="${f1(y)}" r="${f1(0.8 + r() * 1.8)}" fill="rgba(255,236,170,.7)"/>`;
+  }
+  const flowPath = (y0) => { const ys = mid + (y0 - mid) * (1 - nar * 0.95); return `M-24 ${f1(y0)} C80 ${f1(y0)}, 112 ${f1(ys)}, 150 ${f1(ys)} S 250 ${f1(ys)}, 300 ${f1(y0)} L370 ${f1(y0)}`; };
+  let cells = '';
+  const n = Math.round(18 - 8 * score);
+  for (let i = 0; i < n; i++) {
+    const y0 = mid + (r() * 2 - 1) * 34;
+    cells += `<g><g transform="rotate(${Math.round(r() * 60 - 30)})"><ellipse rx="9" ry="6" fill="url(#rbc${id})"/><ellipse rx="4.2" ry="2.6" fill="rgba(70,0,8,.45)"/></g>
+      <animateMotion dur="${f1(3.4 + r() * 1.6 + score)}s" begin="${f1(-r() * 6)}s" repeatCount="indefinite" path="${flowPath(y0)}"/></g>`;
+  }
+  const nFat = opts.fat != null ? opts.fat : Math.round(score * 3);
+  for (let i = 0; i < nFat; i++) {
+    const y0 = mid + (r() * 2 - 1) * 28;
+    cells += `<g><circle r="${f1(2.6 + r() * 2.2)}" fill="url(#fat${id})"/><animateMotion dur="${f1(4.5 + r() * 2)}s" begin="${f1(-r() * 6)}s" repeatCount="indefinite" path="${flowPath(y0)}"/></g>`;
+  }
+  const nSug = opts.sugar || 0;
+  for (let i = 0; i < nSug; i++) {
+    const y0 = mid + (r() * 2 - 1) * 32;
+    cells += `<g><path d="M0,-2.6 L2.3,-1.3 L2.3,1.3 L0,2.6 L-2.3,1.3 L-2.3,-1.3 Z" fill="#fffbe6" opacity=".9"/><animateMotion dur="${f1(2.6 + r() * 1.4)}s" begin="${f1(-r() * 5)}s" repeatCount="indefinite" path="${flowPath(y0)}"/></g>`;
+  }
+  return `<svg class="viz" viewBox="0 0 ${W} 170" role="img" aria-label="Animated illustration of blood flowing through an artery">
+    <defs>
+      <linearGradient id="wall${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#8e3b3f"/><stop offset=".45" stop-color="#d98c86"/><stop offset=".85" stop-color="#eeb9ae"/><stop offset="1" stop-color="#f6d3ca"/></linearGradient>
+      <linearGradient id="wallb${id}" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#7d3236"/><stop offset=".45" stop-color="#cf827d"/><stop offset=".85" stop-color="#eab3a8"/><stop offset="1" stop-color="#f6d3ca"/></linearGradient>
+      <linearGradient id="lum${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3a0409"/><stop offset=".5" stop-color="#7c0f19"/><stop offset="1" stop-color="#320307"/></linearGradient>
+      <linearGradient id="plq${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fbe9b7"/><stop offset=".6" stop-color="#e8c36a"/><stop offset="1" stop-color="#c79a3e"/></linearGradient>
+      <linearGradient id="plqb${id}" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#fbe9b7"/><stop offset=".6" stop-color="#e8c36a"/><stop offset="1" stop-color="#c79a3e"/></linearGradient>
+      <radialGradient id="rbc${id}" cx=".4" cy=".35" r=".7"><stop offset="0" stop-color="#ff6a6f"/><stop offset=".6" stop-color="#d0202c"/><stop offset="1" stop-color="#8e0b16"/></radialGradient>
+      <radialGradient id="fat${id}" cx=".35" cy=".35" r=".7"><stop offset="0" stop-color="#fff6c8"/><stop offset="1" stop-color="#e2b84c"/></radialGradient>
+      <linearGradient id="fade${id}" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset=".08" stop-color="#fff"/><stop offset=".92" stop-color="#fff"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+      <mask id="m${id}"><rect width="${W}" height="170" fill="url(#fade${id})"/></mask>
+      <clipPath id="cp${id}"><path d="${P0 ? P0.t : P.t}">${anim(P0 && P0.t, P.t)}</path><path d="${P0 ? P0.b : P.b}">${anim(P0 && P0.b, P.b)}</path></clipPath>
+      <clipPath id="lc${id}"><rect x="0" y="${top}" width="${W}" height="${bot - top}"/></clipPath>
+    </defs>
+    <g mask="url(#m${id})">
+      <rect x="0" y="${top}" width="${W}" height="${bot - top}" fill="url(#lum${id})"/>
+      <g clip-path="url(#lc${id})">${cells}</g>
+      <rect x="0" y="12" width="${W}" height="${top - 12}" fill="url(#wall${id})"/>
+      <rect x="0" y="${bot}" width="${W}" height="${158 - bot}" fill="url(#wallb${id})"/>
+      <path d="M0 ${top} H${W} M0 ${bot} H${W}" stroke="#ffe3dc" stroke-width="1.4" opacity=".8"/>
+      <path d="M0 18 H${W}" stroke="rgba(255,255,255,.18)" stroke-width="3"/>
+      <path d="${P0 ? P0.t : P.t}" fill="url(#plq${id})" stroke="#f7dccd" stroke-width="1.6">${anim(P0 && P0.t, P.t)}</path>
+      <path d="${P0 ? P0.b : P.b}" fill="url(#plqb${id})" stroke="#f7dccd" stroke-width="1.6">${anim(P0 && P0.b, P.b)}</path>
+      <g clip-path="url(#cp${id})">${speck}</g>
+    </g>
+  </svg>`;
+}
+
+/* ---------- liver ---------- */
+function liverShape() { return 'M12,64 C8,30 58,10 112,13 C152,15 192,20 196,38 C199,54 172,62 150,71 C128,81 108,102 78,114 C52,124 22,112 15,92 C11,82 12,72 12,64 Z'; }
+function liverColors(f) {
+  return { base: mixHex('#7e2620', '#d6ab62', f), light: mixHex('#b4473a', '#f2d896', f), dark: mixHex('#4a1310', '#9c7434', f) };
+}
+/* opts: { from: fat level to animate from, glyc: 0..1 stored sugar, ketones: n } */
+function liverSvg(f, id, opts = {}) {
+  const f0 = opts.from != null ? opts.from : f;
+  const c0 = liverColors(f0), c = liverColors(f);
+  const T = 'dur="4.5s" fill="freeze" calcMode="spline" keyTimes="0;.25;1" keySplines="0 0 1 1;.45 0 .2 1"';
+  const stopAnim = (a, b) => (a !== b ? `<animate attributeName="stop-color" values="${a};${a};${b}" ${T}/>` : '');
+  const r = rng(11);
+  let blot = '';
+  for (let i = 0; i < 40; i++) blot += `<circle cx="${f1(20 + r() * 170)}" cy="${f1(18 + r() * 95)}" r="${f1(2 + r() * 6)}" fill="rgba(255,240,190,${(0.2 + r() * 0.25).toFixed(2)})"/>`;
+  const op0 = clamp(f0 * 1.1, 0, 1).toFixed(2), op1 = clamp(f * 1.1, 0, 1).toFixed(2);
+  // zoomed liver tissue: hepatocytes, nuclei, fat vacuoles (shrink/grow), glycogen granules
+  let cells = '', vac = '', gly = '';
+  const rr = rng(23);
+  const fv = Math.max(f, f0);
+  for (let gy = 0; gy < 7; gy++) for (let gx = 0; gx < 7; gx++) {
+    const cx = 8 + gx * 19 + (gy % 2) * 9 + (rr() - 0.5) * 4, cy = 8 + gy * 19 + (rr() - 0.5) * 4;
+    cells += `<circle cx="${f1(cx)}" cy="${f1(cy)}" r="11.5" fill="#f1b9c8" stroke="#c97891" stroke-width="1"/>`;
+    const roll = rr(), size = 5 + rr() * 6;
+    if (roll < fv * 0.75) {
+      const ra = roll < f0 * 0.75 ? size * clamp(f0 / fv, 0.15, 1) : 0.1;
+      const rb = roll < f * 0.75 ? size * clamp(f / fv, 0.15, 1) : 0.1;
+      vac += `<circle cx="${f1(cx)}" cy="${f1(cy)}" r="${f1(ra)}" fill="#fdf8f4" stroke="#d99aab" stroke-width=".8">${ra !== rb ? `<animate attributeName="r" values="${f1(ra)};${f1(ra)};${f1(rb)}" ${T}/>` : ''}</circle>`;
+    }
+    cells += `<circle cx="${f1(cx + 3)}" cy="${f1(cy - 2)}" r="3" fill="#5b3a8e"/>`;
+    if (opts.glyc != null) for (let k = 0; k < 3; k++) gly += `<circle cx="${f1(cx + (rr() - 0.5) * 14)}" cy="${f1(cy + (rr() - 0.5) * 14)}" r="1.4" fill="#b0287a" opacity="${(0.9 * opts.glyc).toFixed(2)}"/>`;
+  }
+  // ketones streaming out of the liver (fat being turned into fuel)
+  let ket = '';
+  const nk = opts.ketones || 0;
+  for (let i = 0; i < nk; i++) {
+    const sy = 40 + r() * 50;
+    ket += `<circle r="2.4" fill="#ffb547"><animate attributeName="opacity" values="0;1;1;0" dur="3.2s" begin="${f1(-r() * 3.2)}s" repeatCount="indefinite"/>
+      <animateMotion dur="3.2s" begin="${f1(-r() * 3.2)}s" repeatCount="indefinite" path="M${f1(120 + r() * 50)},${f1(sy)} C170,${f1(sy - 20)} 180,${f1(sy + 15)} 205,${f1(70 + (r() - 0.5) * 30)}"/></circle>`;
+  }
+  return `<svg class="viz" viewBox="0 0 340 150" role="img" aria-label="Animated illustration of your liver">
+    <defs>
+      <radialGradient id="lv${id}" cx=".35" cy=".3" r=".85"><stop offset="0" stop-color="${c0.light}">${stopAnim(c0.light, c.light)}</stop><stop offset=".55" stop-color="${c0.base}">${stopAnim(c0.base, c.base)}</stop><stop offset="1" stop-color="${c0.dark}">${stopAnim(c0.dark, c.dark)}</stop></radialGradient>
+      <radialGradient id="gb${id}" cx=".4" cy=".35" r=".7"><stop offset="0" stop-color="#9ccf6a"/><stop offset="1" stop-color="#3f7a2a"/></radialGradient>
+      <clipPath id="lc${id}"><path d="${liverShape()}"/></clipPath>
+      <clipPath id="hc${id}"><circle cx="65" cy="65" r="60"/></clipPath>
+      <filter id="sh${id}" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#000" flood-opacity=".5"/></filter>
+    </defs>
+    <g transform="translate(4,10) scale(.95)">
+      <ellipse cx="70" cy="114" rx="13" ry="9" fill="url(#gb${id})"/>
+      <path d="${liverShape()}" fill="url(#lv${id})" filter="url(#sh${id})"/>
+      <g clip-path="url(#lc${id})"><g opacity="${op0}">${op0 !== op1 ? `<animate attributeName="opacity" values="${op0};${op0};${op1}" ${T}/>` : ''}${blot}</g>
+        <ellipse cx="70" cy="34" rx="58" ry="14" fill="rgba(255,255,255,.16)"/></g>
+      <path d="M120,15 C116,34 117,52 110,74" stroke="${c.dark}" stroke-width="1.6" fill="none" opacity=".7"/>
+      ${ket}
+    </g>
+    <line x1="140" y1="60" x2="196" y2="62" stroke="rgba(255,255,255,.3)" stroke-dasharray="3 3"/>
+    <g transform="translate(200,10)">
+      <circle cx="65" cy="65" r="62" fill="#e6a3b5"/>
+      <g clip-path="url(#hc${id})">${cells}${gly}${vac}</g>
+      <circle cx="65" cy="65" r="61" fill="none" stroke="rgba(255,255,255,.7)" stroke-width="2.5"/>
+    </g>
+    <text x="265" y="146" text-anchor="middle" fill="#8a93a3" font-size="9">zoomed: white = fat${opts.glyc != null ? ' · pink dots = sugar' : ''}</text>
+  </svg>`;
+}
+function liverFatFromHabits(disc) {
+  const s = S.settings, cur = latestWeight();
+  const lab = S.labs.slice().sort((a, b) => (a.date < b.date ? -1 : 1)).filter((l) => l.alt != null).pop();
+  let base = 0.75;
+  if (s.startWeight && cur != null) base = clamp(0.85 - (((s.startWeight - cur) / s.startWeight) * 100) / 12, 0.08, 0.9);
+  if (lab) base = base * 0.6 + clamp((lab.alt - 20) / 30, 0.05, 1) * 0.4;
+  return clamp(base * (1.3 - 0.75 * disc), 0.05, 1);
+}
+
+/* ---------- cells: animated autophagy (cleanup) ---------- */
+function cleanupLevel(h) {
+  if (h < 8) return { n: 0, label: 'Off', cls: '' };
+  if (h < 12) return { n: 1, label: 'Warming up', cls: 'warn' };
+  if (h < 16) return { n: 3, label: 'Active', cls: 'warn' };
+  if (h < 20) return { n: 6, label: 'High', cls: 'ok' };
+  return { n: 8, label: 'Very high', cls: 'ok' };
+}
+function cellSvg(h, id, opts = {}) {
+  const fed = !!opts.fed;
+  const lvl = fed ? { n: 0 } : cleanupLevel(h);
+  const r = rng(42);
+  const W = 320, Hh = 220, cx = 160, cy = 110;
+  const inside = () => { for (;;) { const x = 30 + r() * 260, y = 25 + r() * 170; const dx = (x - cx) / 135, dy = (y - cy) / 92; const dn = (x - 150) / 50, dny = (y - 104) / 42; if (dx * dx + dy * dy < 0.78 && dn * dn + dny * dny > 1.45) return [x, y]; } };
+  let g = '';
+  for (let i = 0; i < 70; i++) { const [x, y] = inside(); g += `<circle cx="${x.toFixed(0)}" cy="${y.toFixed(0)}" r="${f1(0.6 + r() * 1.2)}" fill="rgba(160,210,255,${(0.12 + r() * 0.2).toFixed(2)})"/>`; }
+  g += `<path d="M98,80 C88,100 92,124 112,140 M92,72 C76,98 80,132 106,150 M204,82 C214,100 212,124 194,140 M212,74 C228,100 224,132 200,150" stroke="rgba(120,190,255,.35)" stroke-width="1.6" fill="none"/>`;
+  for (let i = 0; i < 9; i++) {
+    const [x, y] = inside();
+    g += `<g transform="translate(${x.toFixed(0)},${y.toFixed(0)}) rotate(${Math.round(r() * 180)})"><ellipse rx="13" ry="5.5" fill="#ff7a45" opacity=".85"/><path d="M-8,-3 L-6,3 M-3,-4 L-1,4 M2,-4 L4,4 M7,-3 L8,3" stroke="#ffd2b0" stroke-width=".9"/>
+      <animateTransform attributeName="transform" type="translate" additive="sum" values="0,0; ${f1(r() * 5 - 2.5)},${f1(r() * 5 - 2.5)}; 0,0" dur="${f1(4 + r() * 4)}s" repeatCount="indefinite"/></g>`;
+  }
+  // worn-out parts; the first lvl.n run a full cleanup cycle on loop
+  const D = h >= 20 ? 5 : h >= 16 ? 6 : h >= 12 ? 7.5 : 10;
+  const KT = 'keyTimes="0;.22;.42;.62;.78;.9;1"';
+  for (let i = 0; i < 10; i++) {
+    const [x, y] = inside();
+    const pts = Array.from({ length: 7 }, (_, k) => { const a = (k / 7) * Math.PI * 2; const rad = 4 + r() * 4; return `${f1(Math.cos(a) * rad)},${f1(Math.sin(a) * rad)}`; }).join(' ');
+    const active = i < lvl.n;
+    const b = f1(-(i * D) / Math.max(1, lvl.n));
+    const common = `dur="${D}s" begin="${b}s" repeatCount="indefinite" ${KT}`;
+    if (!active) {
+      g += `<g transform="translate(${x.toFixed(0)},${y.toFixed(0)})"><polygon points="${pts}" fill="#8b7a6a" stroke="#5f5247" stroke-width="1">
+        <animateTransform attributeName="transform" type="rotate" values="0;8;0" dur="${f1(5 + r() * 4)}s" repeatCount="indefinite"/></polygon></g>`;
+      continue;
+    }
+    const ang = r() * Math.PI * 2, dx = f1(Math.cos(ang) * 30), dy = f1(Math.sin(ang) * 22);
+    g += `<g transform="translate(${x.toFixed(0)},${y.toFixed(0)})">
+      <g><polygon points="${pts}" fill="#8b7a6a" stroke="#5f5247" stroke-width="1"/>
+        <animateTransform attributeName="transform" type="scale" values="1;1;1;.75;.1;0;1" ${common}/></g>
+      <circle r="0" fill="rgba(93,255,156,.10)" stroke="#5dff9c" stroke-width="1.7">
+        <animate attributeName="r" values="0;13;13;13;11;0;0" ${common}/><animate attributeName="opacity" values="0;1;1;1;.7;0;0" ${common}/></circle>
+      <circle r="0" fill="none" stroke="#5dff9c" stroke-width=".8" opacity=".6"><animate attributeName="r" values="0;16;16;15;13;0;0" ${common}/></circle>
+      <circle r="13" fill="#3ddc97" opacity="0"><animate attributeName="opacity" values="0;0;0;.55;.3;0;0" ${common}/></circle>
+      <circle r="4.2" fill="#3ddc97"><animateTransform attributeName="transform" type="translate" values="${dx},${dy};${dx},${dy};0,0;0,0;0,0;${dx},${dy};${dx},${dy}" ${common}/>
+        <animate attributeName="opacity" values="1;1;1;.3;0;0;1" ${common}/></circle>
+      <g opacity="0"><circle cx="-9" cy="-4" r="1.6" fill="#b9ffd6"/><circle cx="8" cy="-7" r="1.4" fill="#b9ffd6"/><circle cx="6" cy="8" r="1.8" fill="#b9ffd6"/><circle cx="-6" cy="9" r="1.3" fill="#b9ffd6"/>
+        <animate attributeName="opacity" values="0;0;0;0;1;0;0" ${common}/>
+        <animateTransform attributeName="transform" type="scale" values="1;1;1;1;1;1.8;1" ${common}/></g>
+    </g>`;
+  }
+  // free recyclers (lysosomes) drifting
+  for (let i = 0; i < 5; i++) { const [x, y] = inside(); g += `<circle cx="${x.toFixed(0)}" cy="${y.toFixed(0)}" r="4" fill="#3ddc97" opacity=".85"><animate attributeName="opacity" values=".5;1;.5" dur="${f1(2.5 + i * 0.4)}s" repeatCount="indefinite"/></circle>`; }
+  // eating now: sugar & insulin flood in, cleanup shuts off
+  if (fed) {
+    for (let i = 0; i < 22; i++) {
+      const sy = 30 + r() * 160, ex = 90 + r() * 150, ey = 50 + r() * 120;
+      g += `<path d="M0,-2.8 L2.4,-1.4 L2.4,1.4 L0,2.8 L-2.4,1.4 L-2.4,-1.4 Z" fill="#ffd36b"><animateMotion dur="${f1(2.2 + r() * 1.5)}s" begin="${f1(-r() * 3)}s" repeatCount="indefinite" path="M-10,${f1(sy)} C60,${f1(sy)} ${f1(ex - 40)},${f1(ey)} ${f1(ex)},${f1(ey)}"/>
+        <animate attributeName="opacity" values="0;1;1;0" dur="${f1(2.2 + r() * 1.5)}s" begin="${f1(-r() * 3)}s" repeatCount="indefinite"/></path>`;
+    }
+  }
+  return `<svg class="viz" viewBox="0 0 ${W} ${Hh}" role="img" aria-label="Animated illustration of a cell ${fed ? 'after eating' : 'cleaning up damaged parts'}">
+    <defs>
+      <radialGradient id="cyto${id}" cx=".5" cy=".45" r=".6"><stop offset="0" stop-color="${fed ? '#2a2a1a' : '#16324a'}"/><stop offset="1" stop-color="${fed ? '#15140b' : '#0b1a28'}"/></radialGradient>
+      <radialGradient id="nuc${id}" cx=".42" cy=".38" r=".7"><stop offset="0" stop-color="#7fa6ff"/><stop offset=".6" stop-color="#3561d6"/><stop offset="1" stop-color="#1c3488"/></radialGradient>
+      <filter id="glow${id}" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    </defs>
+    <rect width="${W}" height="${Hh}" fill="#06080c"/>
+    <ellipse cx="${cx}" cy="${cy}" rx="140" ry="97" fill="url(#cyto${id})" stroke="${fed ? '#ffcf5c' : '#5fd3ff'}" stroke-width="2.2" filter="url(#glow${id})" opacity=".95">
+      <animate attributeName="rx" values="140;142.5;140" dur="5s" repeatCount="indefinite"/><animate attributeName="ry" values="97;95.5;97" dur="5s" repeatCount="indefinite"/></ellipse>
+    <g filter="url(#glow${id})"><ellipse cx="150" cy="104" rx="44" ry="36" fill="url(#nuc${id})"/><ellipse cx="162" cy="96" rx="9" ry="7" fill="#a9c1ff" opacity=".6"/></g>
+    ${g}
+  </svg>`;
+}
+
+/* ---------- LIVE card on the Fast tab ---------- */
+function bloodNow(h) { return { fat: Math.round(clamp(8 - h * 0.6, 0, 8)), sugar: Math.round(clamp(12 - h * 1.1, 1, 12)) }; }
+function glycogenPct(h) { return h < 4 ? 100 : clamp(Math.round(100 - (h - 4) * 7), 10, 100); }
+function fatBurnPct(h) { return clamp(Math.round((h - 6) * 7), 5, 100); }
+
+function liveCard() {
+  if (!S.active) return '';
+  const h = (Date.now() - S.active.start) / H;
+  const view = ui.live || 'cells';
+  const hs = habitStates();
+  let body = '', line = '';
+  if (view === 'cells') {
+    const c = cleanupLevel(h);
+    body = cellSvg(h, 'L');
+    line = `<div class="row" style="justify-content:space-between;margin-top:8px"><b>Cell cleanup</b><span class="pill ${c.cls}">${c.label}</span></div>
+      <p class="small muted">${h < 8 ? `Cleanup usually needs a longer gap without food. Around ${Math.max(1, Math.ceil(12 - h))}h from now it really gets going.` : h < 16 ? 'Green bubbles are wrapping up worn-out parts; recyclers then dissolve them. It speeds up the longer you go.' : 'Full cleanup mode. Damaged parts are being broken down and reused as raw material.'}</p>`;
+  } else if (view === 'blood') {
+    const b = bloodNow(h);
+    body = arterySvg(plaqueFromHabits(hs.now), 'B', { fat: b.fat, sugar: b.sugar });
+    line = `<div class="row" style="justify-content:space-between;margin-top:8px"><b>Sugar & fat in your blood</b><span class="pill ${h >= 10 ? 'ok' : 'warn'}">${h < 4 ? 'High' : h < 10 ? 'Falling' : 'Low & steady'}</span></div>
+      <p class="small muted">White crystals = sugar, yellow drops = fat. They fall hour by hour as you fast. Plaque size here follows your last 14 days of habits.</p>`;
+  } else {
+    const gp = glycogenPct(h), fb = fatBurnPct(h);
+    body = liverSvg(liverFatFromHabits(hs.now), 'V', { glyc: gp / 100, ketones: h >= 12 ? Math.min(10, Math.round(2 + (h - 12))) : 0 });
+    line = `<div class="meter"><span>Stored sugar</span><div class="bar2"><div style="width:${gp}%;background:#c0398a"></div></div><b>${gp}%</b></div>
+      <div class="meter"><span>Fat burning</span><div class="bar2"><div style="width:${fb}%;background:var(--amber)"></div></div><b>${fb}%</b></div>
+      <p class="small muted">Your liver uses up its stored sugar first, then switches to burning fat and sends out ketones (orange) as fuel.</p>`;
+  }
+  return `<section class="card" id="liveCard" data-h="${Math.floor(h)}" data-v="${view}">
+    <div class="card-head"><h3>Live inside you</h3><span class="pill">${Math.floor(h)}h</span></div>
+    <div class="seg"><button class="${view === 'cells' ? 'on' : ''}" data-act="liveView" data-v="cells">Cells</button><button class="${view === 'blood' ? 'on' : ''}" data-act="liveView" data-v="blood">Blood</button><button class="${view === 'liver' ? 'on' : ''}" data-act="liveView" data-v="liver">Liver</button></div>
+    <div class="viz-wrap">${body}</div>
+    ${line}
+    <p class="note" style="margin:6px 0 0">Animated illustration of what fasting does. Timings are approximate and differ from person to person.</p>
+  </section>`;
+}
+
+/* ---------- Health tab: what your habits did over 14 days ---------- */
+function habitLine(hs) {
+  if (!hs.hasData) return '<p class="small muted">Finish fasts and tick your daily wins — this redraws from your habits every day.</p>';
+  const d = Math.round((hs.now - hs.prev) * 100);
+  return `<p class="small">Your last 14 days: <b>${Math.round(hs.now * 100)}%</b> discipline${d ? ` <span style="color:${d > 0 ? 'var(--accent)' : 'var(--red)'}">(${d > 0 ? '+' : ''}${d} vs before)</span>` : ''}.</p>`;
+}
+function arteryCard() {
+  const hs = habitStates();
+  const s0 = plaqueFromHabits(hs.prev), s1 = plaqueFromHabits(hs.now);
+  const k = ui.replay || 0;
+  const better = s1 < s0 - 0.01, worse = s1 > s0 + 0.01;
+  return `<section class="card">
+    <div class="card-head"><h3>Your arteries</h3><span class="pill ${better ? 'ok' : worse ? 'warn' : ''}">${better ? 'Clearing' : worse ? 'Building up' : 'Holding'}</span></div>
+    <div class="viz-wrap" data-k="${k}">${arterySvg(s1, 'H' + k, { from: s0 })}</div>
+    ${habitLine(hs)}
+    <button class="link" data-act="replay">↻ Replay</button>
+    <p class="note" style="margin:6px 0 0">Shows the direction your habits push plaque risk${arteryScore(latestLab()) != null ? ', starting from your lab numbers' : ''}. Real plaque changes over months to years.</p>
+  </section>`;
+}
+function liverCard() {
+  const hs = habitStates();
+  const f0 = liverFatFromHabits(hs.prev), f = liverFatFromHabits(hs.now);
+  const k = ui.replay || 0;
+  const lbl = f > 0.6 ? ['Fatty', 'warn'] : f > 0.3 ? ['Clearing', 'warn'] : ['Healthy-looking', 'ok'];
+  return `<section class="card">
+    <div class="card-head"><h3>Your liver</h3><span class="pill ${lbl[1]}">${lbl[0]}</span></div>
+    <div class="viz-wrap">${liverSvg(f, 'G' + k, { from: f0 })}</div>
+    <p class="small muted">Liver fat responds fastest to fasting, sugar-free days and walking — and to weight loss.</p>
+    <p class="note" style="margin:6px 0 0">Illustration driven by your habits${S.settings.startWeight ? ' and weight' : ''}, not an ultrasound.</p>
+  </section>`;
+}
+
+/* ---------- "Eat now?" comparison ---------- */
+function eatNowCompare(h) {
+  return `<div class="split" style="margin-top:12px">
+    <div><div class="eyebrow" style="color:var(--accent)">Keep going</div><div class="viz-wrap">${cellSvg(Math.max(h, 13), 'K')}</div><p class="small muted" style="margin:4px 0 0">Cleanup keeps running</p></div>
+    <div><div class="eyebrow" style="color:var(--amber)">Eat now</div><div class="viz-wrap">${cellSvg(h, 'E', { fed: true })}</div><p class="small muted" style="margin:4px 0 0">Sugar + insulin flood in, cleanup stops</p></div>
+  </div>`;
+}
+
+/* ======================= HEALTH (numbers) ======================= */
+function latestWeight() { const w = S.body.filter((b) => b.weight != null); return w.length ? w[w.length - 1].weight : null; }
+function latestWaist() { const w = S.body.filter((b) => b.waist != null); return w.length ? w[w.length - 1].waist : null; }
+
+function unlockList(lost, pct) {
+  return [
+    { need: { kg: 1 }, title: '1 kg lighter', body: 'Diabetes Prevention Program: every kg lost came with about 16% lower diabetes risk.' },
+    { need: { kg: 2 }, title: '2 kg lighter', body: 'Blood pressure drops roughly 1 mmHg for every kg lost (meta-analysis of 25 trials).' },
+    { need: { pct: 3 }, title: '3% of your weight', body: 'The first clinically meaningful milestone: blood sugar and triglycerides start improving.' },
+    { need: { pct: 5 }, title: '5% of your weight', body: 'Fatty-liver study: 58% of people who lost ≥5% saw liver inflammation resolve.' },
+    { need: { kg: 5 }, title: '5 kg lighter', body: 'DiRECT trial: a third of people with type 2 diabetes who lost 5–10 kg went into remission.' },
+    { need: { pct: 7 }, title: '7% of your weight', body: 'The Diabetes Prevention Program goal. With 150 active min/week, diabetes risk fell 58%.' },
+    { need: { pct: 10 }, title: '10% of your weight', body: 'Fatty-liver study: 90% saw inflammation resolve and 45% saw scarring reverse.' },
+    { need: { kg: 10 }, title: '10 kg lighter', body: 'DiRECT trial: 57% of people with type 2 diabetes who lost 10–15 kg went into remission.' },
+    { need: { kg: 15 }, title: '15 kg lighter', body: 'DiRECT trial: 86% of people with type 2 diabetes who lost 15 kg+ went into remission.' },
+  ].map((u) => {
+    const on = u.need.kg != null ? lost >= u.need.kg : pct >= u.need.pct;
+    let togo = '';
+    if (!on) {
+      const sw = S.settings.startWeight;
+      const needKg = u.need.kg != null ? u.need.kg - lost : sw ? (u.need.pct / 100) * sw - lost : null;
+      togo = needKg != null ? `${round1(needKg)} kg to go` : '';
+    }
+    return Object.assign(u, { on, togo });
+  });
+}
+
+function weightChart() {
+  const pts = S.body.filter((b) => b.weight != null).slice(-20);
+  if (pts.length < 2) return '';
+  const ws = pts.map((p) => p.weight);
+  const min = Math.min(...ws) - 0.5, max = Math.max(...ws) + 0.5;
+  const W = 320, Hh = 110;
+  const xy = pts.map((p, i) => [12 + (i / (pts.length - 1)) * (W - 24), 10 + (1 - (p.weight - min) / (max - min)) * (Hh - 20)]);
+  const line = xy.map((p, i) => `${i ? 'L' : 'M'}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' ');
+  const area = `${line} L${xy[xy.length - 1][0].toFixed(1)},${Hh} L${xy[0][0].toFixed(1)},${Hh} Z`;
+  return `<svg class="chart" viewBox="0 0 ${W} ${Hh}" preserveAspectRatio="none" role="img" aria-label="Weight trend">
+    <defs><linearGradient id="garea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="rgba(61,220,151,.35)"/><stop offset="1" stop-color="rgba(61,220,151,0)"/></linearGradient></defs>
+    <path class="area" d="${area}"/><path class="line" d="${line}"/>
+    <circle cx="${xy[xy.length - 1][0]}" cy="${xy[xy.length - 1][1]}" r="4"/></svg>
+    <div class="row" style="justify-content:space-between"><span class="muted small">${fmtDay(pts[0].date)}</span><span class="muted small">${fmtDay(pts[pts.length - 1].date)}</span></div>`;
+}
+
+function evalLabs(l) {
+  const sx = S.settings.sex;
+  const rows = [];
+  const add = (label, v, unit, fn, note) => { if (v != null) rows.push({ label, v, unit, s: fn(v), note }); };
+  const ldlT = Number(S.settings.ldlTarget) || 100;
+  const hdlMin = sx === 'female' ? 50 : 40;
+  add('HbA1c', l.hba1c, '%', (v) => (v < 5.7 ? 'g' : v < 6.5 ? 'a' : 'r'), 'Normal <5.7 · prediabetes 5.7–6.4');
+  add('Fasting glucose', l.fpg, 'mg/dL', (v) => (v < 100 ? 'g' : v < 126 ? 'a' : 'r'), 'Normal <100');
+  add('LDL cholesterol', l.ldl, 'mg/dL', (v) => (v < ldlT ? 'g' : v < ldlT + 30 ? 'a' : 'r'), `Your target <${ldlT}`);
+  add('HDL cholesterol', l.hdl, 'mg/dL', (v) => (v > hdlMin ? 'g' : v >= hdlMin - 5 ? 'a' : 'r'), `Aim above ${hdlMin}`);
+  add('Triglycerides', l.tg, 'mg/dL', (v) => (v < 150 ? 'g' : v < 200 ? 'a' : 'r'), 'Aim below 150');
+  if (l.tg != null && l.hdl) {
+    const cut = sx === 'female' ? 2.5 : 3.5;
+    add('TG / HDL ratio', round1(l.tg / l.hdl), '', (v) => (v < cut ? 'g' : v < cut * 1.4 ? 'a' : 'r'), `Insulin-resistance marker · aim <${cut}`);
+  }
+  add('ALT (liver)', l.alt, 'U/L', (v) => (v <= 30 ? 'g' : v <= 40 ? 'a' : 'r'), 'Above 30 can signal fatty liver');
+  if (l.sys != null && l.dia != null) {
+    const s = l.sys < 130 && l.dia < 80 ? 'g' : l.sys < 140 && l.dia < 90 ? 'a' : 'r';
+    rows.push({ label: 'Blood pressure', v: `${l.sys}/${l.dia}`, unit: '', s, note: 'Target <130/80', key: 'bp' });
+  }
+  return rows;
+}
+
+function renderNumbers() {
+  const set = S.settings;
+  const cur = latestWeight();
+  const sw = set.startWeight;
+  let html = '';
+
+  if (!sw) {
+    html += `<section class="card"><h3>Set your starting point</h3>
+      <p class="muted">Used for your milestones and BMI (Indian cut-offs).</p>
+      <div class="split">
+        <label class="field"><span>Weight now (kg)</span><input type="number" inputmode="decimal" id="setupWeight" step="0.1"></label>
+        <label class="field"><span>Height (cm)</span><input type="number" inputmode="decimal" id="setupHeight" value="${set.heightCm || ''}"></label>
+      </div>
+      <label class="field"><span>Sex (for HDL & waist cut-offs)</span><select id="setupSex"><option value="male" ${set.sex === 'male' ? 'selected' : ''}>Male</option><option value="female" ${set.sex === 'female' ? 'selected' : ''}>Female</option></select></label>
+      <button class="btn block" data-act="saveSetup">Save</button></section>`;
+    html += arteryCard() + liverCard() + watchCard();
+  } else {
+    const now = cur != null ? cur : sw;
+    const lost = Math.max(0, sw - now);
+    const pct = (lost / sw) * 100;
+    const ms = [3, 5, 7, 10, 15].find((m) => pct < m);
+    html += `<section class="card">
+      <div class="eyebrow">Lost since start</div>
+      <div class="hero-num"><span class="big mono">${round1(lost)}</span><span class="muted">kg · ${round1(pct)}%</span></div>
+      <div class="muted small">${round1(sw)} kg → ${round1(now)} kg</div>
+      ${ms ? `<div class="progress"><div style="width:${Math.min(100, (pct / ms) * 100)}%"></div></div><div class="muted small">${round1((ms / 100) * sw - lost)} kg to the ${ms}% milestone</div>` : ''}
+      ${weightChart()}
+      <button class="btn block" style="margin-top:12px" data-act="addBody">Add weekly weigh-in</button>
+    </section>`;
+    html += arteryCard() + liverCard() + watchCard();
+
+    const ul = unlockList(lost, pct);
+    const unlocked = ul.filter((u) => u.on);
+    const nextUp = ul.filter((u) => !u.on).slice(0, 2);
+    html += `<section class="card"><div class="card-head"><h3>Unlocked</h3><span class="pill">${unlocked.length}/${ul.length}</span></div>
+      <div class="unlocks">
+      ${unlocked.slice().reverse().map((u) => `<div class="unlock on"><div class="t"><span>\u{1F513} ${esc(u.title)}</span></div><div class="b">${esc(u.body)}</div></div>`).join('')}
+      ${nextUp.map((u) => `<div class="unlock off"><div class="t"><span>\u{1F512} ${esc(u.title)}</span><span class="muted small">${esc(u.togo)}</span></div><div class="b">${esc(u.body)}</div></div>`).join('')}
+      </div>
+      <p class="note">These are averages from published studies, not predictions for you. Benefits overlap rather than add up.</p></section>`;
+  }
+
+  // body lights
+  const w = cur != null ? cur : sw;
+  const waist = latestWaist();
+  const bodyRows = [];
+  if (w && set.heightCm) {
+    const bmi = w / Math.pow(set.heightCm / 100, 2);
+    const s = bmi < 18 ? 'a' : bmi < 23 ? 'g' : bmi < 25 ? 'a' : 'r';
+    bodyRows.push({ label: 'BMI', v: round1(bmi), unit: '', s, note: 'Indian cut-offs: 18–22.9 normal · 23–24.9 overweight · 25+ obese' });
+  }
+  if (waist) {
+    const cut = set.sex === 'female' ? 80 : 90;
+    bodyRows.push({ label: 'Waist', v: waist, unit: 'cm', s: waist < cut - 5 ? 'g' : waist < cut ? 'a' : 'r', note: `Belly-fat risk at ${cut} cm+ (South Asian cut-off)` });
+  }
+  if (bodyRows.length) html += `<section class="card"><h3>Body</h3><div style="margin-top:6px">${bodyRows.map((r) => lightRow(r)).join('')}</div></section>`;
+
+  // labs
+  const labs = S.labs.slice().sort((a, b) => (a.date < b.date ? -1 : 1));
+  const last = labs[labs.length - 1];
+  const prev = labs[labs.length - 2];
+  html += `<section class="card"><div class="card-head"><h3>Lab report</h3>${last ? `<span class="muted small">${fmtDay(last.date)}</span>` : ''}</div>`;
+  if (last) {
+    const pr = prev ? Object.fromEntries(evalLabs(prev).map((r) => [r.label, r])) : {};
+    html += evalLabs(last).map((r) => lightRow(r, pr[r.label])).join('');
+  } else {
+    html += '<p class="muted">Add your blood test every 3 months: HbA1c, lipid profile, liver (ALT) and BP. You’ll see traffic lights against Indian targets.</p>';
+  }
+  html += `<button class="btn ghost block" style="margin-top:12px" data-act="addLabs">Add lab results</button></section>
+    <p class="note">Cut-offs: ADA 2026 (blood sugar), Cardiological Society of India (lipids), IDF South Asian criteria (waist), Indian consensus (BMI). Ask your doctor which LDL target applies to you and set it in Settings. This app is a motivation tool, not medical advice.</p>`;
+  return html;
+}
+
+function lightRow(r, prev) {
+  let delta = '';
+  if (prev && typeof r.v === 'number' && typeof prev.v === 'number' && r.v !== prev.v) {
+    const diff = round1(r.v - prev.v);
+    const lowerBetter = r.label !== 'HDL cholesterol';
+    const good = lowerBetter ? diff < 0 : diff > 0;
+    delta = `<div class="delta ${good ? 'good' : 'bad'}">${diff > 0 ? '▲' : '▼'} ${Math.abs(diff)} since last</div>`;
+  }
+  return `<div class="light"><div class="lamp ${r.s}"></div>
+    <div class="grow"><div>${esc(r.label)}</div><div class="muted small">${esc(r.note)}</div></div>
+    <div><div class="val">${esc(r.v)}${r.unit ? ` <span class="muted small">${esc(r.unit)}</span>` : ''}</div>${delta}</div></div>`;
+}
+
+function addBodySheet() {
+  openSheet(`<h2>Weekly weigh-in</h2>
+    <p class="muted small">Same day, same time, after the bathroom, before eating.</p>
+    <label class="field"><span>Date</span><input type="date" id="bDate" value="${dayKey()}"></label>
+    <div class="split">
+      <label class="field"><span>Weight (kg)</span><input type="number" inputmode="decimal" step="0.1" id="bWeight" value="${latestWeight() || ''}"></label>
+      <label class="field"><span>Waist (cm)</span><input type="number" inputmode="decimal" step="0.5" id="bWaist" placeholder="at the navel"></label>
+    </div>
+    <button class="btn block" data-act="saveBody">Save</button>
+    ${S.body.length ? `<section style="margin-top:18px"><h3>History</h3>${S.body.slice(-8).reverse().map((b) => `<div class="list-item"><div class="grow">${fmtDay(b.date)}</div><div>${b.weight != null ? b.weight + ' kg' : ''}${b.waist != null ? ' · ' + b.waist + ' cm' : ''}</div><button class="x" data-act="delBody" data-d="${b.date}" aria-label="Delete">×</button></div>`).join('')}</section>` : ''}`);
+}
+
+function addLabsSheet() {
+  const f = (id, label, ph) => `<label class="field"><span>${label}</span><input type="number" inputmode="decimal" step="0.1" id="${id}" placeholder="${ph}"></label>`;
+  openSheet(`<h2>Add lab results</h2>
+    <p class="muted small">Fill only what your report has.</p>
+    <label class="field"><span>Report date</span><input type="date" id="lDate" value="${dayKey()}"></label>
+    <div class="split">${f('lHba1c', 'HbA1c (%)', 'e.g. 6.1')}${f('lFpg', 'Fasting glucose', 'mg/dL')}</div>
+    <div class="split">${f('lLdl', 'LDL', 'mg/dL')}${f('lHdl', 'HDL', 'mg/dL')}</div>
+    <div class="split">${f('lTg', 'Triglycerides', 'mg/dL')}${f('lAlt', 'ALT / SGPT', 'U/L')}</div>
+    <div class="split">${f('lSys', 'BP systolic', 'top number')}${f('lDia', 'BP diastolic', 'bottom number')}</div>
+    <button class="btn block" data-act="saveLabs">Save report</button>
+    ${S.labs.length ? `<section style="margin-top:18px"><h3>Past reports</h3>${S.labs.slice().reverse().map((l) => `<div class="list-item"><div class="grow">${fmtDay(l.date)}</div><button class="x" data-act="delLabs" data-d="${l.date}" aria-label="Delete">×</button></div>`).join('')}</section>` : ''}`);
+}
+
+/* ======================= SETTINGS ======================= */
+function openSettings(focus) {
+  const s = S.settings;
+  const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+  openSheet(`<h2>Settings</h2>
+    <section id="sec-future">
+      <h3>Message to your future self</h3>
+      <p class="muted small">Shown when you try to end a fast early or hit SOS. Write why you’re doing this — your health, your family, how you want to feel at 60.</p>
+      <textarea id="futureMsg" placeholder="Hey, it’s me. I know this craving feels huge right now…">${esc(s.futureMsg)}</textarea>
+    </section>
+
+    <section id="sec-plans">
+      <h3>If-then plans</h3>
+      <p class="muted small">Decide now what you’ll do in your hardest moment.</p>
+      <div id="planList">${S.plans.map((p, i) => planRow(p, i)).join('')}</div>
+      <button class="btn ghost sm" data-act="addPlan">+ Add plan</button>
+    </section>
+
+    <section>
+      <h3>About you</h3>
+      <label class="field"><span>Name (for greeting)</span><input type="text" id="sName" value="${esc(s.name)}" maxlength="30"></label>
+      <div class="split">
+        <label class="field"><span>Height (cm)</span><input type="number" inputmode="decimal" id="sHeight" value="${s.heightCm || ''}"></label>
+        <label class="field"><span>Starting weight (kg)</span><input type="number" inputmode="decimal" step="0.1" id="sStart" value="${s.startWeight || ''}"></label>
+      </div>
+      <div class="split">
+        <label class="field"><span>Sex</span><select id="sSex"><option value="male" ${s.sex === 'male' ? 'selected' : ''}>Male</option><option value="female" ${s.sex === 'female' ? 'selected' : ''}>Female</option></select></label>
+        <label class="field"><span>LDL target (ask doctor)</span><select id="sLdl">
+          ${[[100, '<100 (low/moderate risk)'], [70, '<70 (high risk / fatty liver)'], [55, '<55 (very high risk)']].map(([v, l]) => `<option value="${v}" ${Number(s.ldlTarget) === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+      </div>
+      <label class="field"><span>Level</span><select id="sLevel">${LEVELS.map((l) => `<option value="${l.n}" ${l.n === s.level ? 'selected' : ''}>${l.n}. ${l.name} (${l.fast}h, ${l.steps} steps)</option>`).join('')}</select></label>
+      <button class="btn block" data-act="saveSettings">Save</button>
+    </section>
+
+    <section>
+      <h3>Reminders & danger-hour alerts</h3>
+      <p class="muted small">${HOSTED ? 'This version can’t send notifications. Set each of these as a daily alarm in the iPhone <b>Clock</b> app.' : `Sent by your server every day at these times (${esc(s.tz)}).`}</p>
+      <div id="remList">${S.reminders.length ? S.reminders.map((r) => `<div class="list-item"><div class="grow"><b>${esc(r.time)}</b> · ${esc(r.body)}</div><button class="x" data-act="delReminder" data-id="${esc(r.id)}" aria-label="Delete">×</button></div>`).join('') : '<p class="muted small">None yet. Add one, or use “Alert me” on the Patterns tab.</p>'}</div>
+      <div class="row gap" style="margin-top:8px">
+        <input type="time" id="remTime" value="21:30" style="width:150px;flex:none">
+        <input type="text" id="remBody" placeholder="e.g. Kitchen is closed — brush your teeth" class="grow">
+      </div>
+      <button class="btn ghost sm" style="margin-top:8px" data-act="addReminder">+ Add reminder</button>
+    </section>
+
+    ${HOSTED ? hostedDataSection() : watchSettingsSection() + `<section>
+      <h3>Your server</h3>
+      <p class="muted small">${standalone ? '' : '<b>First add Steady to your Home Screen</b> (Share → Add to Home Screen) and open it from the icon — iPhone only allows notifications there. '}Leave the address empty if this app is served from your server.</p>
+      <label class="field"><span>Server address</span><input type="text" id="sServer" value="${esc(s.serverUrl)}" placeholder="(same as this page)" autocapitalize="off" autocorrect="off"></label>
+      <label class="field"><span>App token</span><input type="password" id="sToken" value="${esc(s.token)}" placeholder="APP_TOKEN from your server" autocapitalize="off"></label>
+      <div class="stack">
+        <button class="btn block" data-act="enablePush">${s.notify ? 'Re-connect notifications' : 'Turn on notifications'}</button>
+        ${s.notify ? '<button class="btn ghost block" data-act="testPush">Send a test notification</button>' : ''}
+        <label class="row gap small"><input type="checkbox" id="sAuto" ${s.autoBackup ? 'checked' : ''}> Auto-backup my data to the server</label>
+      </div>
+    </section>
+
+    <section>
+      <h3>Backup</h3>
+      <p class="muted small">Your data lives on this phone. iPhone can clear website data, so keep a backup.${s.lastBackup ? ` Last server backup: ${fmtDay(s.lastBackup)}, ${fmtTime(s.lastBackup)}.` : ''}</p>
+      <div class="split">
+        <button class="btn ghost" data-act="backupServer">Back up to server</button>
+        <button class="btn ghost" data-act="restoreServer">Restore from server</button>
+        <button class="btn ghost" data-act="exportFile">Export file</button>
+        <label class="btn ghost" style="display:grid;place-items:center">Import file<input type="file" accept="application/json,.json" id="importFile" hidden></label>
+      </div>
+      <button class="link" style="color:var(--red);margin-top:10px" data-act="resetAll">Erase all data on this phone</button>
+    </section>`}`);
+  if (focus) {
+    const el = document.getElementById(focus === 'plans' ? 'sec-plans' : focus);
+    if (el) setTimeout(() => { el.scrollIntoView({ block: 'start' }); if (el.focus && focus !== 'plans') el.focus(); }, 280);
+  }
+}
+function watchCard() {
+  const days = [];
+  for (let i = 6; i >= 0; i--) { const k = addDays(dayKey(), -i); days.push([k, S.watch[k]]); }
+  if (!days.some(([, v]) => v)) return '';
+  const max = Math.max(level().steps, ...days.map(([, v]) => (v && v.steps) || 0));
+  const lw = lastWatch();
+  const stat = (v, l) => (v != null ? `<div class="stat"><div class="v">${v}</div><div class="l">${l}</div></div>` : '');
+  const avg = (key) => { const xs = days.map(([, v]) => v && v[key]).filter((x) => x != null); return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null; };
+  const st = [stat(lw.restingHR != null ? Math.round(lw.restingHR) : null, 'resting HR'), stat(avg('sleepHours') != null ? round1(avg('sleepHours')) + 'h' : null, 'avg sleep'), stat(avg('exerciseMinutes') != null ? Math.round(avg('exerciseMinutes')) : null, 'exercise min/day'), stat(avg('activeEnergy') != null ? Math.round(avg('activeEnergy')) : null, 'active kcal/day')].filter(Boolean).slice(0, 3).join('');
+  return `<section class="card">
+    <div class="card-head"><h3>⌚ Apple Watch · 7 days</h3><span class="muted small">synced ${fmtTime(lw.at)}</span></div>
+    <div class="bars">${days.map(([k, v]) => { const s = (v && v.steps) || 0; return `<div class="bar-col"><div class="bar-val">${s ? (s / 1000).toFixed(1) + 'k' : ''}</div><div class="bar ${s >= level().steps ? '' : 'short'}" style="height:${Math.max(4, (s / max) * 100)}%"></div><div class="bar-lbl">${toDate(k).toLocaleDateString([], { weekday: 'short' }).slice(0, 2)}</div></div>`; }).join('')}</div>
+    <p class="muted small">Green = hit your ${level().steps.toLocaleString()}-step goal.</p>
+    ${st ? `<div class="stats" style="margin-top:8px">${st}</div>` : ''}
+  </section>`;
+}
+function watchSettingsSection() {
+  const lw = lastWatch();
+  return `<section>
+      <h3>⌚ Apple Watch</h3>
+      <p class="muted small">Steps (and optionally sleep, resting heart rate, weight) arrive through an iPhone Shortcuts automation that sends them to your server. Steps then tick your daily goal automatically.</p>
+      <p class="small">${lw ? `Last data: ${fmtDay(lw.date)}, received ${fmtTime(lw.at)} ✅` : 'No data received yet.'}</p>
+      <div class="split"><button class="btn ghost" data-act="watchHelp">How to set up</button><button class="btn ghost" data-act="watchSync">Sync now</button></div>
+    </section>`;
+}
+function watchHelpSheet() {
+  const base = (S.settings.serverUrl || location.origin).replace(/\/+$/, '');
+  const step = (n, t, d) => `<div class="plan"><div><b style="color:var(--accent)">${n}.</b> <b style="color:var(--text)">${t}</b><div class="muted small" style="margin-top:2px">${d}</div></div></div>`;
+  openSheet(`<h2>Apple Watch sync</h2>
+    <p class="muted small">One-time setup in the iPhone <b>Shortcuts</b> app (built in). It runs by itself every day after that.</p>
+    <div class="card flat" style="margin:10px 0"><div class="eyebrow">Your values</div>
+      <div class="small" style="margin-top:6px">URL: <code style="user-select:all;word-break:break-all">${esc(base)}/api/watch</code></div>
+      <div class="small" style="margin-top:4px">Header: <code>X-App-Token</code> = your app token</div></div>
+    ${step(1, 'Make the shortcut', 'Shortcuts → + (new shortcut) → name it “Steady sync”.')}
+    ${step(2, 'Get today’s steps', 'Add <b>Find Health Samples</b>: Type is <b>Steps</b>, Start Date is <b>Today</b>. Then add <b>Calculate Statistics</b>: <b>Sum</b> of Health Samples.')}
+    ${step(3, 'Today’s date', 'Add <b>Format Date</b>: Current Date, Date Format <b>Custom</b> = <code>yyyy-MM-dd</code>.')}
+    ${step(4, 'Send it', 'Add <b>Get Contents of URL</b> with the URL above. Show More → Method <b>POST</b> → Headers: add <code>X-App-Token</code> with your token → Request Body <b>JSON</b>: add <code>date</code> = Formatted Date, <code>steps</code> = Statistics (Number).')}
+    ${step(5, 'Test', 'Tap ▶ in the shortcut. Then come back here and tap <b>Sync now</b>.')}
+    ${step(6, 'Automate it', 'Shortcuts → Automation → + → <b>Time of Day</b> (e.g. 1 pm, 6 pm, 9:30 pm, one automation each) → Daily → <b>Run Immediately</b> → pick “Steady sync”.')}
+    <p class="muted small" style="margin-top:10px">Optional extra JSON fields, each from its own Find Health Samples + Calculate Statistics: <code>activeEnergy</code> (Sum), <code>exerciseMinutes</code> (Sum), <code>restingHR</code> (Average), <code>weight</code> (latest, kg), <code>sleepHours</code>.</p>
+    <p class="muted small">The first run asks permission to read Health and to connect to your server — tap <b>Always Allow</b>.</p>
+    <button class="btn block" style="margin-top:12px" data-act="openSettings">Done</button>`);
+}
+function hostedDataSection() {
+  const st = { saved: 'Saved to your Claude account ✅', connecting: 'Connecting to your Claude account…', error: 'Last cloud save failed — will retry on your next change', off: 'Cloud save unavailable here — data is only in this browser. Export a backup.' }[cloud.status] || '';
+  return `<section>
+      <h3>Your data</h3>
+      <p class="small">${st}</p>
+      <p class="muted small">Your data syncs privately to your Claude account, so it survives reloads and works on any device where you’re signed in. Keep an occasional backup file too.</p>
+      <div class="split">
+        <button class="btn ghost" data-act="exportFile">${cloud.downloads ? 'Download backup' : 'Copy backup'}</button>
+        <label class="btn ghost" style="display:grid;place-items:center">Import backup<input type="file" accept="application/json,.json,.txt" id="importFile" hidden></label>
+      </div>
+      <button class="link" style="color:var(--red);margin-top:10px" data-act="resetAll">Erase all my data</button>
+      <p class="muted small" style="margin-top:10px">⌚ Apple Watch sync needs the server version of Steady (it receives data from an iPhone Shortcut).</p>
+    </section>`;
+}
+function planRow(p, i) {
+  return `<div class="card flat" style="margin:8px 0;padding:12px" data-plan="${i}">
+    <label class="field" style="margin-top:0"><span>If…</span><input type="text" data-pif="${i}" value="${esc(p.if)}" maxlength="120"></label>
+    <label class="field" style="margin-bottom:0"><span>Then I…</span><input type="text" data-pthen="${i}" value="${esc(p.then)}" maxlength="120"></label>
+    <button class="link" style="color:var(--red)" data-act="delPlan" data-i="${i}">Remove</button></div>`;
+}
+function readPlansFromSheet() {
+  const out = [];
+  document.querySelectorAll('[data-pif]').forEach((el) => {
+    const i = el.dataset.pif;
+    const then = (document.querySelector(`[data-pthen="${i}"]`) || {}).value || '';
+    if (el.value.trim() || then.trim()) out.push({ if: el.value.trim(), then: then.trim() });
+  });
+  return out;
+}
+function saveSettingsFromSheet(silent) {
+  const s = S.settings;
+  const g = (id) => document.getElementById(id);
+  if (g('futureMsg')) s.futureMsg = g('futureMsg').value.trim();
+  if (g('planList')) S.plans = readPlansFromSheet();
+  if (g('sName')) s.name = g('sName').value.trim();
+  if (g('sHeight')) s.heightCm = num(g('sHeight').value);
+  if (g('sStart')) s.startWeight = num(g('sStart').value);
+  if (g('sSex')) s.sex = g('sSex').value;
+  if (g('sLdl')) s.ldlTarget = Number(g('sLdl').value);
+  if (g('sLevel')) { const n = Number(g('sLevel').value); if (n !== s.level) { s.level = n; s.levelSince = dayKey(); } }
+  if (g('sServer')) s.serverUrl = g('sServer').value.trim();
+  if (g('sToken')) s.token = g('sToken').value.trim();
+  if (g('sAuto')) s.autoBackup = g('sAuto').checked;
+  save();
+  if (!silent) { toast('Saved'); closeSheet(); }
+  render();
+}
+
+async function exportFile() {
+  if (HOSTED) {
+    const json = JSON.stringify(S, null, 2);
+    const filename = `steady-backup-${dayKey()}.json`;
+    if (cloud.downloads) {
+      try { await cloud.downloads.save({ filename, data: json }); return; } catch (e) { /* declined or failed; fall back */ }
+    }
+    try { await navigator.clipboard.writeText(json); toast('Backup copied — paste it into Notes to keep it safe.'); }
+    catch { toast('Could not copy the backup here.'); }
+    return;
+  }
+  const blob = new Blob([JSON.stringify(S, null, 2)], { type: 'application/json' });
+  const name = `steady-backup-${dayKey()}.json`;
+  const file = new File([blob], name, { type: 'application/json' });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    navigator.share({ files: [file], title: 'Steady backup' }).catch(() => {});
+    return;
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
+function importData(obj) {
+  if (!obj || typeof obj !== 'object' || !obj.settings) { toast('That doesn’t look like a Steady backup'); return; }
+  const keep = { serverUrl: S.settings.serverUrl, token: S.settings.token, notify: S.settings.notify };
+  S = mergeState(obj);
+  Object.assign(S.settings, keep);
+  save();
+  closeSheet();
+  toast('Data restored');
+  render();
+}
+
+/* ======================= actions ======================= */
+const actions = {
+  closeSheet,
+  openSettings: (el) => openSettings(el.dataset.focus),
+  setTarget: (el) => { ui.target = Number(el.dataset.h); render(); },
+  liveView: (el) => { ui.live = el.dataset.v; const c = $('#liveCard'); if (c) c.outerHTML = liveCard(); },
+  replay: () => { ui.replay = (ui.replay || 0) + 1; render(); },
+  watchHelp: () => { saveSettingsFromSheet(true); watchHelpSheet(); },
+  watchSync: async () => { saveSettingsFromSheet(true); await syncWatch(); const lw = lastWatch(); toast(lw ? `Apple Watch data: ${fmtDay(lw.date)}${lw.steps != null ? ' \u00b7 ' + Math.round(lw.steps).toLocaleString() + ' steps' : ''}` : 'Nothing received yet \u2014 run the shortcut first'); openSettings(); },
+  startFast,
+  endFast,
+  finishFast,
+  editStart,
+  saveStart: () => {
+    const v = $('#editStartAt').value;
+    const t = new Date(v).getTime();
+    if (!Number.isFinite(t) || t > Date.now()) { toast('Pick a time in the past'); return; }
+    S.active.start = t;
+    S.active.target = Number($('#editTarget').value);
+    save(); syncFastToServer(); closeSheet(); render();
+  },
+  cancelFast: () => { S.active = null; save(); syncFastToServer(); closeSheet(); toast('Fast deleted'); render(); },
+  sosFromFast: () => { closeSheet(); sosStart('surf'); },
+  sosStart: (el) => sosStart(el.dataset.kind),
+  sosFinish: () => { S.sos.phase = 'after'; ui.sosAfter = Math.max(0, Math.min(10, S.sos.before - 3)); save(); render(); },
+  sosOutcome: (el) => sosOutcome(el.dataset.o),
+  slipMood: (el) => { const v = el.dataset.v; const m = ui.slip.moods; const i = m.indexOf(v); if (i >= 0) m.splice(i, 1); else m.push(v); el.classList.toggle('on'); },
+  slipPlace: (el) => { ui.slip.place = ui.slip.place === el.dataset.v ? null : el.dataset.v; el.parentElement.querySelectorAll('.chip').forEach((c) => c.classList.toggle('on', c.dataset.v === ui.slip.place)); },
+  slipAgo: (el) => { ui.slip.ago = Number(el.dataset.v); el.parentElement.querySelectorAll('.chip').forEach((c) => c.classList.toggle('on', c === el)); },
+  logSlip,
+  delSlip: (el) => { S.slips = S.slips.filter((s) => String(s.t) !== el.dataset.t); save(); render(); },
+  addDangerReminder: (el) => {
+    const h = Number(el.dataset.h);
+    const d = new Date(); d.setHours(h, 0, 0, 0); d.setTime(d.getTime() - 15 * MIN);
+    const time = hhmm(d);
+    S.reminders = S.reminders.filter((r) => r.kind !== 'danger');
+    S.reminders.push({ id: uid(), time, kind: 'danger', tab: 'sos', body: `Your danger hour starts soon. Craving? Open SOS and ride it out.` });
+    save();
+    if (S.settings.notify) syncReminders(true);
+    else if (HOSTED) { toast(`Saved. Now set a daily ${fmtTime(d)} alarm in the iPhone Clock app.`); }
+    else { toast(`Alert saved for ${fmtTime(d)}. Turn on notifications in Settings to get it.`); }
+  },
+  toggleDay: (el) => { const k = el.dataset.k; const d = dayData(dayKey()); setDay(dayKey(), { [k]: !d[k] }); render(); },
+  levelUp: () => { if (S.settings.level < LEVELS.length) { S.settings.level++; S.settings.levelSince = dayKey(); save(); openSheet(`<div class="center"><div class="confetti">\u{1F680}</div><h2>Level ${level().n}: ${level().name}</h2><p class="muted">New goals: ${level().fast}h fasts and ${level().steps.toLocaleString()} steps.</p><button class="btn block" data-act="closeSheet">Let’s go</button></div>`); render(); } },
+  levelDown: () => { if (S.settings.level > 1) { S.settings.level--; S.settings.levelSince = dayKey(); save(); toast('Stepped back. Consistency beats intensity.'); render(); } },
+  saveSetup: () => {
+    const w = num($('#setupWeight').value), h = num($('#setupHeight').value);
+    if (!w) { toast('Enter your weight'); return; }
+    S.settings.startWeight = w; S.settings.heightCm = h; S.settings.sex = $('#setupSex').value;
+    S.body.push({ date: dayKey(), weight: w, waist: null });
+    save(); render();
+  },
+  addBody: addBodySheet,
+  saveBody: () => {
+    const date = $('#bDate').value || dayKey();
+    const weight = num($('#bWeight').value), waist = num($('#bWaist').value);
+    if (weight == null && waist == null) { toast('Enter weight or waist'); return; }
+    S.body = S.body.filter((b) => b.date !== date);
+    S.body.push({ date, weight, waist });
+    S.body.sort((a, b) => (a.date < b.date ? -1 : 1));
+    save(); closeSheet(); toast('Saved'); render();
+  },
+  delBody: (el) => { S.body = S.body.filter((b) => b.date !== el.dataset.d); save(); addBodySheet(); render(); },
+  addLabs: addLabsSheet,
+  saveLabs: () => {
+    const g = (id) => num($('#' + id).value);
+    const l = { date: $('#lDate').value || dayKey(), hba1c: g('lHba1c'), fpg: g('lFpg'), ldl: g('lLdl'), hdl: g('lHdl'), tg: g('lTg'), alt: g('lAlt'), sys: g('lSys'), dia: g('lDia') };
+    if (Object.entries(l).every(([k, v]) => k === 'date' || v == null)) { toast('Enter at least one value'); return; }
+    S.labs = S.labs.filter((x) => x.date !== l.date);
+    S.labs.push(l);
+    save(); closeSheet(); toast('Report saved'); render();
+  },
+  delLabs: (el) => { S.labs = S.labs.filter((x) => x.date !== el.dataset.d); save(); addLabsSheet(); render(); },
+  saveSettings: () => saveSettingsFromSheet(false),
+  addPlan: () => { S.plans = readPlansFromSheet(); S.plans.push({ if: '', then: '' }); $('#planList').innerHTML = S.plans.map((p, i) => planRow(p, i)).join(''); },
+  delPlan: (el) => { S.plans = readPlansFromSheet(); S.plans.splice(Number(el.dataset.i), 1); $('#planList').innerHTML = S.plans.map((p, i) => planRow(p, i)).join(''); save(); },
+  addReminder: () => {
+    const time = $('#remTime').value, body = $('#remBody').value.trim();
+    if (!time) { toast('Pick a time'); return; }
+    saveSettingsFromSheet(true);
+    S.reminders.push({ id: uid(), time, body: body || 'Check in: how are you doing?', tab: 'sos' });
+    save(); syncReminders(S.settings.notify); openSettings();
+  },
+  delReminder: (el) => { saveSettingsFromSheet(true); S.reminders = S.reminders.filter((r) => r.id !== el.dataset.id); save(); syncReminders(false); openSettings(); },
+  enablePush: async () => { saveSettingsFromSheet(true); await enablePush(); },
+  testPush: async () => { saveSettingsFromSheet(true); try { const r = await api('POST', '/api/test'); toast(r.sent ? 'Sent — check your notifications' : 'Server couldn’t deliver it. Try re-connecting.'); } catch (e) { toast(e.message); } },
+  backupServer: async () => { saveSettingsFromSheet(true); await backupToServer(false); },
+  restoreServer: async () => {
+    saveSettingsFromSheet(true);
+    try {
+      const r = await api('GET', '/api/backup');
+      if (!r.backup) { toast('No backup on the server yet'); return; }
+      openSheet(`<h2>Restore from server?</h2><p class="muted">Backup from ${fmtDay(r.at)}, ${fmtTime(r.at)}. This replaces the data on this phone.</p>
+        <div class="stack"><button class="btn block" data-act="confirmRestore">Restore</button><button class="btn ghost block" data-act="openSettings">Cancel</button></div>`);
+      actions._pendingRestore = r.backup;
+    } catch (e) { toast('Could not reach server: ' + e.message); }
+  },
+  confirmRestore: () => { if (actions._pendingRestore) importData(actions._pendingRestore); actions._pendingRestore = null; },
+  exportFile: () => { saveSettingsFromSheet(true); exportFile(); },
+  resetAll: () => openSheet(`<h2>Erase everything?</h2><p class="muted">This deletes all fasts, logs and numbers on this phone. Export a backup first if unsure.</p>
+    <div class="stack"><button class="btn danger block" data-act="confirmReset">Erase</button><button class="btn ghost block" data-act="openSettings">Cancel</button></div>`),
+  confirmReset: () => { const keep = { serverUrl: S.settings.serverUrl, token: S.settings.token, notify: S.settings.notify }; S = defaults(); Object.assign(S.settings, keep); save(); closeSheet(); go('fast'); toast('Erased'); },
+};
+
+document.addEventListener('click', (e) => {
+  const tb = e.target.closest('#tabs button');
+  if (tb) { go(tb.dataset.tab); return; }
+  const el = e.target.closest('[data-act]');
+  if (!el) return;
+  const fn = actions[el.dataset.act];
+  if (fn) { e.preventDefault(); fn(el); }
+});
+
+document.addEventListener('input', (e) => {
+  const k = e.target.dataset && e.target.dataset.input;
+  if (!k) return;
+  if (k === 'sosBefore') { ui.sosBefore = Number(e.target.value); $('#beforeVal').textContent = `${ui.sosBefore}/10`; }
+  if (k === 'sosAfter') { ui.sosAfter = Number(e.target.value); $('#afterVal').textContent = `${ui.sosAfter}/10`; }
+});
+document.addEventListener('change', (e) => {
+  if (e.target.dataset && e.target.dataset.input === 'steps') {
+    setDay(dayKey(), { steps: Math.max(0, Math.round(Number(e.target.value) || 0)) });
+    render();
+  }
+  if (e.target.id === 'importFile' && e.target.files[0]) {
+    const r = new FileReader();
+    r.onload = () => { try { importData(JSON.parse(r.result)); } catch { toast('Could not read that file'); } };
+    r.readAsText(e.target.files[0]);
+  }
+});
+
+/* ======================= ticker ======================= */
+let lastFastDone = null;
+function tick() {
+  if (tab === 'fast' && S.active) {
+    const el = Date.now() - S.active.start;
+    const e1 = $('#fastElapsed');
+    if (e1) e1.textContent = fmtHMS(el);
+    const done = el >= S.active.target * H;
+    if (lastFastDone === false && done) { render(); toast(`\u{1F389} ${S.active.target}h reached!`); }
+    lastFastDone = done;
+    const r = $('#ringFg');
+    if (r) { const c = 2 * Math.PI * 100; r.setAttribute('stroke-dashoffset', (c * (1 - Math.min(1, el / (S.active.target * H)))).toFixed(1)); }
+    const st = $('#fastStage');
+    if (st) st.textContent = stageText(el);
+    const cc = $('#liveCard');
+    if (cc && Number(cc.dataset.h) !== Math.floor(el / H)) cc.outerHTML = liveCard();
+  }
+  if (S.sos && S.sos.phase === 'during') {
+    const left = S.sos.dur - (Date.now() - S.sos.start);
+    if (left <= 0) {
+      S.sos.phase = 'after';
+      ui.sosAfter = Math.max(0, Math.min(10, S.sos.before - 3));
+      save();
+      if (tab === 'sos') render();
+      toast('10 minutes done. How is the craving now?');
+    } else if (tab === 'sos') {
+      const l = $('#sosLeft'); if (l) l.textContent = fmtMS(left);
+      const cue = $('#breathCue');
+      if (cue) { const p = ((Date.now() - S.sos.start) / 1000) % 10; cue.textContent = p < 4 ? 'Breathe in' : 'Breathe out'; }
+    }
+  }
+}
+setInterval(tick, 1000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { S = load(); render(); syncWatch(); } });
+if (!HOSTED) setInterval(syncWatch, 5 * MIN);
+
+/* ======================= boot ======================= */
+if (!HOSTED && 'serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    if (e.data && e.data.type === 'open') {
+      const t = new URL(e.data.url).searchParams.get('tab');
+      if (t) go(t);
+    }
+  });
+}
+const startTab = new URLSearchParams(location.search).get('tab');
+go(startTab || (S.sos ? 'sos' : 'fast'));
+if (HOSTED) initCloud(); else syncWatch();
